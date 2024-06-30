@@ -5,11 +5,7 @@ project(llama3_cuda LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Set CUDA architectures
-set(CMAKE_CUDA_ARCHITECTURES 75 80 86)  # Adjust these to match your target GPUs
 
-# Find CUDA package
-find_package(CUDA REQUIRED)
 
 # Add CUDA include directories
 include_directories(${CUDA_INCLUDE_DIRS})
