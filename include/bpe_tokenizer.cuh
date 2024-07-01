@@ -31,9 +31,6 @@ public:
     void safe_printf(const std::string& piece) const;
     std::vector<int> encode(const std::string& text, bool bos, bool eos) const;
 
-    static int sample_argmax(const std::vector<float>& probabilities);
-    static int64_t time_in_ms();
-
 private:
 
     struct TokenIndex {

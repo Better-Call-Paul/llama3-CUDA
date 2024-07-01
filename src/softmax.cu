@@ -1,5 +1,7 @@
 #include "softmax.cuh"
 
+namespace llama {
+
 template<typename T, int cols_per_thread>
 __inline__ __device__ void llama::warpReduceMax(T *val, int warp_size) {
     #pragma unroll
@@ -170,3 +172,6 @@ template<int cols_per_thread>
               }
           }
       }
+
+
+}

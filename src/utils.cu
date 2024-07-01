@@ -1,4 +1,4 @@
-#include "multi_head.cuh"
+#include "utils.cuh"
 
 
 namespace llama {

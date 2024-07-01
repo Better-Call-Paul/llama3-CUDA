@@ -1,4 +1,3 @@
-#include <iostream>
 
 #define CUDA_ERROR_CHECKER(call) \
     do { \
@@ -9,6 +8,10 @@
         } \
     } while (0)
 
+void generate() {
+
+
+}
 
 int main(int argc, char* argv[]) {
 
