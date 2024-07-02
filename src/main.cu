@@ -1,12 +1,15 @@
-
-#define CUDA_ERROR_CHECKER(call) \
-    do { \
-        cudaError_t error = call \
-        if (error != cudaSucess) { \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(error));
-            exit(EXIT_FAILURE); \
-        } \
-    } while (0)
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <stdexcept>
+#include <memory>
+#include <vector>
+#include <iostream>
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 void generate() {
 
