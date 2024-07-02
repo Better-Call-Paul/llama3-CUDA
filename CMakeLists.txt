@@ -1,16 +1,19 @@
-cmake_minimum_required(VERSION 2.8 FATAL_ERROR)
+cmake_minimum_required(VERSION 2.8)
 
-project(llama3_cuda LANGUAGES CXX CUDA)
+project(llama3 C CXX)
 
-set(CMAKE_CUDA_STANDARD 14)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+# Find CUDA
+find_package(CUDA REQUIRED)
 
+# Include directories
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include ${CUDA_INCLUDE_DIRS})
 
-#[[ Set compute for target GPU ]]
-# set(CMAKE_CUDA_ARCHITECTURES XX)
+# Set CUDA flags
+set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS};-arch=sm_60)
 
-include_directories(${CMAKE_SOURCE_DIR}/include)
+# Add CUDA executable
+cuda_add_executable(llama3 src/main.cu src/bpe_tokenizer.cu src/mat_add.cu src/mat_mul.cu src/softmax.cu src/multi_head.cu src/flash_attention.cu src/layer_norm.cu
+src/transformer.cu src/utils.cu)
 
-add_executable(llama3_cuda src/main.cu)
-
-
+# Link CUDA libraries
+target_link_libraries(llama3 ${CUDA_LIBRARIES})
