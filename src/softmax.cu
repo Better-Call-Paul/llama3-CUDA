@@ -148,7 +148,6 @@ __device__ T Inf() {
     } else if (std::is_same<T, half>::value) {
         return __float2half(INFINITY);
     }
-    // Add more types if needed
     return T(0);  
 }
 

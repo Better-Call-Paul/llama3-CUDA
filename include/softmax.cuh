@@ -4,6 +4,8 @@
 
 namespace llama {
 
+#define FULL_MASK 0xffffffff
+
 template<typename T, int cols_per_thread>
 __inline__ __device__ void llama::warpReduceMax(T *val, int warp_size);
 
