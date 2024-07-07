@@ -2,25 +2,24 @@
 
 namespace llama {
 
-
-Tokeinzer::Tokeinzer(const std::string &tokenizer_path, int vocab_size) : vocab_size(vocab_size) {
+Tokenizer::Tokenizer(const std::string &tokenizer_path, int vocab_size) : vocab_size(vocab_size) {
     initialize_byte_pieces();
     load_tokenizer(tokenizer_path);
 }
 
-Tokenizer::initialize_byte_pieces() {
+void Tokenizer::initialize_byte_pieces() {
     for (int i = 0; i < 256; i++) {
         byte_pieces[i * 2] = static_cast<char>(i);
         byte_pieces[i * 2 + 1] = '\0';
     }
 }
 
-Tokenizer::load_tokenizer(const std::string& tokenizer_path){
+void Tokenizer::load_tokenizer(const std::string& tokenizer_path) {
     std::ifstream file(tokenizer_path, std::ios::binary);
 
     if (!file) throw std::runtime_error("Failed to Load " + tokenizer_path);
 
-    file.read(reinterept_cast<char*>(&max_token_length), sizeof(int));
+    file.read(reinterpret_cast<char*>(&max_token_length), sizeof(int));
 
     vocab.reserve(vocab_size);
     vocab_scores.reserve(vocab_size);
@@ -29,8 +28,8 @@ Tokenizer::load_tokenizer(const std::string& tokenizer_path){
     int len;
     std::string token;
     for (int i = 0; i < vocab_size; ++i) {
-        file.read(reinterept_cast<char*>(&score), sizeof(float));
-        file.read(reinterept_cast<char*>(&len), sizeof(int));
+        file.read(reinterpret_cast<char*>(&score), sizeof(float));
+        file.read(reinterpret_cast<char*>(&len), sizeof(int));
 
         token.resize(len);
         file.read(&token[0], len);
@@ -41,25 +40,26 @@ Tokenizer::load_tokenizer(const std::string& tokenizer_path){
 
     sorted_vocab.reserve(vocab_size);
     for (int i = 0; i < vocab_size; ++i) {
-        sorted_vocab.emplace_back(vocab[i], i);
+        sorted_vocab.emplace_back(TokenIndex{vocab[i], i});
     }
-    return std::sort(sorted_vocab.begin(), sorted_vocab.end(), []{const auto& a, const auto& b} { return a.str < b.str;});
+    std::sort(sorted_vocab.begin(), sorted_vocab.end(), [](const auto& a, const auto& b) { return a.str < b.str; });
 }
 
-int Tokeinzer::str_lookup(const std::string& str) const {
-    auto it = std::lower_bound(sorted_vocab.begin(), sorted_vocab.end(), str, []{const auto& a, const auto& b} { a.str < b.str; });
-    if (it != it.end() && it->str == str) {
+int Tokenizer::str_lookup(const std::string& str) const {
+    auto it = std::lower_bound(sorted_vocab.begin(), sorted_vocab.end(), str, 
+                               [](const TokenIndex& a, const std::string& b) { return a.str < b; });
+    if (it != sorted_vocab.end() && it->str == str) {
         return it->id;
     }
     return -1;
 }
 
-void safe_printf(const std::string& piece) const {
+void Tokenizer::safe_printf(const std::string& piece) const {
     if (piece.empty()) return;
 
-    usigned char fbit = piece[0];
+    unsigned char fbit = piece[0];
     if (piece.length() == 1) {
-        if (!std::isprint(fbit) || std::isspace(fbit)) {
+        if (!std::isprint(fbit) && !std::isspace(fbit)) {
             return;
         }
     }
@@ -79,17 +79,13 @@ void safe_printf(const std::string& piece) const {
     }
 }
 
-/*
- * @param: bos, beginning of sequence token requested
- * @param: eos, end of sequence token requested
- */
-std::vector<int> encode(const std::string& text, bool bos, bool eos) const {
+std::vector<int> Tokenizer::encode(const std::string& text, bool bos, bool eos) const {
     std::vector<int> tokens;
     
     if (bos) tokens.push_back(1);
 
     // Handle leading spaces
-    if (!text.empty) {
+    if (!text.empty()) {
         int dummy_prefix = str_lookup(" ");
         tokens.push_back(dummy_prefix);
     }
@@ -98,18 +94,18 @@ std::vector<int> encode(const std::string& text, bool bos, bool eos) const {
     std::string str_buffer;
     str_buffer.reserve(max_token_length * 2 + 3);
     for (size_t i = 0; i < text.length(); ++i) {
-        if ((text[i] & 0xC0) != 0x80) {// not continuition byte check 
+        if ((text[i] & 0xC0) != 0x80) { // not continuation byte check 
             str_buffer.clear();
         }
         str_buffer += text[i];
-        if (i + 1 == text.length() || (text[i + 1] & 0x80) || str_buffer.length >= 4) {// last byte check
+        if (i + 1 == text.length() || (text[i + 1] & 0xC0) != 0x80 || str_buffer.length() >= 4) { // last byte check
             int id = str_lookup(str_buffer);
-            if (id != 1) {
+            if (id != -1) {
                 tokens.push_back(id);
             }
             else {
                 for (unsigned char c : str_buffer) {
-                    tokens.push_back(c + 3);
+                    tokens.push_back(static_cast<int>(c) + 3);
                 }
             }
         }
@@ -122,10 +118,10 @@ std::vector<int> encode(const std::string& text, bool bos, bool eos) const {
         for (size_t i = 0; i < tokens.size() - 1; ++i) {
             str_buffer = vocab[tokens[i]] + vocab[tokens[i + 1]];
             int id = str_lookup(str_buffer);
-            int curr_score = max(vocab_scores[tokens[i]], vocab_scores[tokens[i + 1]]);
+            float curr_score = std::max(vocab_scores[tokens[i]], vocab_scores[tokens[i + 1]]);
             if (id != -1 && vocab_scores[id] > curr_score) {
                 tokens[i] = id;
-                tokens.erase(tokens.begin() + i + 1)
+                tokens.erase(tokens.begin() + i + 1);
                 merged = true;
                 break;
             }
@@ -137,7 +133,7 @@ std::vector<int> encode(const std::string& text, bool bos, bool eos) const {
     return tokens;
 }
 
-std::string decode(int prev_token, int token) const {
+std::string Tokenizer::decode(int prev_token, int token) const {
     std::string piece = vocab[token];
 
     if (prev_token == 1 && piece[0] == ' ') {

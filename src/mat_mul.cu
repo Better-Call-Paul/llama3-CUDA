@@ -40,8 +40,25 @@ namespace llama {
         __syncthreads();
     }
     if (row < d) {
-        output[row] = sum;
+        outputv[row] = sum;
     }
  }
+
+ __global__ void silu_elementwise_mul_kernel(float *a, float *b, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float val = a[idx];
+        // SiLU activation: x * sigmoid(x)
+        val *= (1.0f / (1.0f + expf(-val)));
+        // Elementwise multiplication
+        a[idx] = val * b[idx];
+    }
+}
+
+void silu_elementwise_mul(float *a, float *b, int size) {
+    int block_size = 256;
+    int grid_size = (size + block_size - 1) / block_size;
+    silu_elementwise_mul_kernel<<<grid_size, block_size>>>(a, b, size);
+}
 
 }
