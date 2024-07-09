@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <iostream>
 
 namespace llama {
 
@@ -14,32 +15,6 @@ namespace llama {
         throw std::runtime_error(std::string("CUDA Error: ") + cudaGetErrorString(val)); \
     } \
 }
-
-struct Config {
-    int dim;
-    int hidden_dim;
-    int n_layers;
-    int n_heads;
-    int n_kv_heads;
-    int vocab_size;
-    int max_seq_len;
-};
-
-class TransformerWeights {
-public:
-    float* token_embedding;
-    float* rms_att_weight;
-    float* wq;
-    float* wk;
-    float* wv;
-    float* wo;
-    float* rms_ffn_weight;
-    float* w1;
-    float* w2;
-    float* w3;
-    float* rms_final_weight;
-    float* wcls;
-};
 
 RunState::RunState(const Config& config) {
     int kv_dim = (config.dim * config.n_kv_heads) / config.n_heads;
@@ -78,10 +53,16 @@ Transformer::Transformer(const std::string& checkpoint_path) : fd(-1), data(null
     state = std::make_unique<RunState>(config);
 }
 
-Transformer::~Transformer() {
+Transformer::~Transformer() noexcept {
     if (data != MAP_FAILED) { munmap(data, file_size); }
     if (fd != -1) { close(fd); }
-    CUDA_CHECK(cudaFree(weights.token_embedding));
+    try {
+        if (weights.token_embedding) {
+            cudaFree(weights.token_embedding);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Error in destructor: " << e.what() << "\n";
+    }
 }
 
 void Transformer::read_checkpoint(const std::string& checkpoint_path) {
