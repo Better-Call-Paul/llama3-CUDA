@@ -6,6 +6,11 @@
 #include <stdexcept>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <iostream>
+#include "rms_norm.cuh"
+#include "rope_rotation.cuh"
+#include "mat_mul.cuh"
+#include "multi_head_attention.cuh"
 
 namespace llama {
 
@@ -14,32 +19,6 @@ namespace llama {
         throw std::runtime_error(std::string("CUDA Error: ") + cudaGetErrorString(val)); \
     } \
 }
-
-struct Config {
-    int dim;
-    int hidden_dim;
-    int n_layers;
-    int n_heads;
-    int n_kv_heads;
-    int vocab_size;
-    int max_seq_len;
-};
-
-class TransformerWeights {
-public:
-    float* token_embedding;
-    float* rms_att_weight;
-    float* wq;
-    float* wk;
-    float* wv;
-    float* wo;
-    float* rms_ffn_weight;
-    float* w1;
-    float* w2;
-    float* w3;
-    float* rms_final_weight;
-    float* wcls;
-};
 
 RunState::RunState(const Config& config) {
     int kv_dim = (config.dim * config.n_kv_heads) / config.n_heads;
@@ -78,10 +57,16 @@ Transformer::Transformer(const std::string& checkpoint_path) : fd(-1), data(null
     state = std::make_unique<RunState>(config);
 }
 
-Transformer::~Transformer() {
+Transformer::~Transformer() noexcept {
     if (data != MAP_FAILED) { munmap(data, file_size); }
     if (fd != -1) { close(fd); }
-    CUDA_CHECK(cudaFree(weights.token_embedding));
+    try {
+        if (weights.token_embedding) {
+            cudaFree(weights.token_embedding);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Error in destructor: " << e.what() << "\n";
+    }
 }
 
 void Transformer::read_checkpoint(const std::string& checkpoint_path) {
@@ -146,6 +131,82 @@ void Transformer::memory_map_weights(float* ptr, bool shared_weights) {
     ptr += config.dim;
     ptr += config.max_seq_len * head_size; // skip RoPE parameters
     weights.wcls = shared_weights ? weights.token_embedding : ptr;
+}
+
+std::vector<float> Transformer::forward(int token, int pos) {
+    Config* p = &this->config;
+    TransformerWeights* w = &this->weights;
+    RunState* s = this->state.get();
+    float* x = s->x;
+    int dim = p->dim;
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    int kv_mul = p->n_heads / p->n_kv_heads;
+    int hidden_dim = p->hidden_dim;
+    int head_size = dim / p->n_heads;
+
+    // Copy the token embedding into x
+    cudaMemcpy(x, w->token_embedding + token * dim, dim * sizeof(float), cudaMemcpyDeviceToDevice);
+
+    // Forward all the layers
+    for (int l = 0; l < p->n_layers; l++) {
+        // Attention rmsnorm
+        rmsnorm(s->xb, x, w->rms_att_weight + l * dim, dim);
+
+        // QKV matmuls
+        matmul(s->q, s->xb, w->wq + l * dim * dim, dim, dim);
+        matmul(s->k, s->xb, w->wk + l * dim * kv_dim, dim, kv_dim);
+        matmul(s->v, s->xb, w->wv + l * dim * kv_dim, dim, kv_dim);
+
+        // RoPE relative positional encoding
+        rope_rotation(pos, s->q, s->k, dim, kv_dim, head_size);
+
+        // Cache key and value
+        int loff = l * p->max_seq_len * kv_dim;
+        cudaMemcpy(s->key_cache + loff + pos * kv_dim, s->k, kv_dim * sizeof(float), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(s->value_cache + loff + pos * kv_dim, s->v, kv_dim * sizeof(float), cudaMemcpyDeviceToDevice);
+
+        // Multihead attention
+        multi_head_attention(pos, p->max_seq_len, s->q, s->key_cache + loff, s->value_cache + loff, 
+                             s->att, s->xb, dim, kv_dim, p->n_heads, kv_mul, head_size);
+
+        // Final matmul to get the output of the attention
+        matmul(s->xb2, s->xb, w->wo + l * dim * dim, dim, dim);
+
+        // Residual connection
+        for (int i = 0; i < dim; i++) {
+            x[i] += s->xb2[i];
+        }
+
+        // FFN rmsnorm
+        rmsnorm(s->xb, x, w->rms_ffn_weight + l * dim, dim);
+
+        // FFN
+        matmul(s->hb, s->xb, w->w1 + l * dim * hidden_dim, dim, hidden_dim);
+        matmul(s->hb2, s->xb, w->w3 + l * dim * hidden_dim, dim, hidden_dim);
+
+        // SwiGLU non-linearity
+        silu_elementwise_mul(s->hb, s->hb2, hidden_dim);
+
+        // Final matmul to get the output of the ffn
+        matmul(s->xb, s->hb, w->w2 + l * hidden_dim * dim, hidden_dim, dim);
+
+        // Residual connection
+        for (int i = 0; i < dim; i++) {
+            x[i] += s->xb[i];
+        }
+    }
+
+    // Final rmsnorm
+    rmsnorm(x, x, w->rms_final_weight, dim);
+
+    // Classifier into logits
+    matmul(s->logits_gpu, x, w->wcls, p->dim, p->vocab_size);
+
+    // Copy logits from GPU to CPU
+    s->logits.resize(p->vocab_size);
+    cudaMemcpy(s->logits.data(), s->logits_gpu, p->vocab_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    return s->logits;
 }
 
 }
