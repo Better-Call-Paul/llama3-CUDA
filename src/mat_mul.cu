@@ -1,23 +1,10 @@
 #include "mat_mul.cuh"
+#include <string>
+#include <stdexcept>
+#include <iostream>
 
 namespace llama {
     
-/**
- * @brief Performs matrix-vector multiplication on the GPU
- *
- * This kernel computes the product of a matrix w and a vector x, storing the result in xout.
- * It uses shared memory and tiling for improved performance.
- *
- * @tparam T The data type of the matrices and vectors (e.g., float, double, half)
- * @tparam BLOCK_SIZE The number of threads per block
- * @tparam TILE_SIZE The size of the tile (chunk) processed at a time
- *
- * @param[out] outpt Pointer to the output vector (d x 1)
- * @param[in] input Pointer to the input vector (n x 1)
- * @param[in] weight Pointer to the weight matrix (d x n)
- * @param[in] n The number of columns in weight
- * @param[in] d The number of rows in weight
- */
  template<typename T, int BLOCK_SIZE, int TILE_SIZE>
  __global__ void mat_mul_kernel(const T* __restrict__ inputv, const T* __restrict__ weightv, T* __restrict__ outputv, int n, int d) {
     // shared mem
@@ -59,6 +46,38 @@ void silu_elementwise_mul(float *a, float *b, int size) {
     int block_size = 256;
     int grid_size = (size + block_size - 1) / block_size;
     silu_elementwise_mul_kernel<<<grid_size, block_size>>>(a, b, size);
+}
+
+__global__ void matmul_kernel(float *outpt, const float *input, const float *weight, int n, int d) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < d && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < n; ++i) {
+            sum += weight[row * n + i] * input[i];
+        }
+        outpt[row] = sum;
+    }
+}
+
+void matmul(float *outpt, const float *input, const float *weight, int n, int d) {
+    dim3 threadsPerBlock(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 numBlocks((n + BLOCK_SIZE - 1) / BLOCK_SIZE, (d + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+    matmul_kernel<<<numBlocks, threadsPerBlock>>>(outpt, input, weight, n, d);
+    
+    // Check for any errors launching the kernel
+    cudaError_t cudaStatus = cudaGetLastError();
+    if (cudaStatus != cudaSuccess) {
+        throw std::runtime_error("matmul kernel launch failed: " + std::string(cudaGetErrorString(cudaStatus)));
+    }
+    
+    cudaStatus = cudaDeviceSynchronize();
+    if (cudaStatus != cudaSuccess) {
+        throw std::runtime_error("cudaDeviceSynchronize returned error after launching matmul kernel: " 
+                                 + std::string(cudaGetErrorString(cudaStatus)));
+    }
 }
 
 }

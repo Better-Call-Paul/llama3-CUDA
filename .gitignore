@@ -6,3 +6,4 @@
 *.fatbin
 llama3/
 build/
+Meta-Llama-3-8B/*

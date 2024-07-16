@@ -42,7 +42,6 @@ public:
     RunState(const RunState&) = delete;
     RunState& operator=(const RunState&) = delete;
   
-private:
     float *x, *xb, *xb2, *hb, *hb2, *q, *k, *v, *att, *logits_gpu;
     std::vector<float> logits;
     float *key_cache, *value_cache;
@@ -55,12 +54,14 @@ public:
 
     Transformer(const Transformer&) = delete;
     Transformer& operator=(const Transformer&) = delete;
+    std::vector<float> forward(int token, int pos);
+
+    Config config;
 
 private:
     void read_checkpoint(const std::string& checkpoint_path);
     void memory_map_weights(float* ptr, bool shared_weights);
 
-    Config config;
     TransformerWeights weights;
     std::unique_ptr<RunState> state;
     int fd;
