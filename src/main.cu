@@ -62,8 +62,8 @@ void generate(Transformer& transformer, Tokenizer& tokenizer, const std::string&
 int main(int argc, char *argv[]) {
     std::string checkpoint_path = "../Meta-Llama-3-8B/consolidated.00.pth";
     std::string tokenizer_path = "../Meta-Llama-3-8B/tokenizer.bin";
-    int max_new_tokens = 50;
-    std::string prompt = "I have a dream";
+    int max_new_tokens = 100;
+    std::string prompt = "Hello";
 
     if (argc >= 2) prompt = argv[1];
 
