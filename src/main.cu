@@ -20,7 +20,7 @@ void generate(Transformer& transformer, Tokenizer& tokenizer, const std::string&
     std::vector<int> prompt_tokens = tokenizer.encode(prompt, true, false);
     
     if (prompt_tokens.empty()) {
-        std::cerr << "Something is wrong, expected at least 1 prompt token\n";
+        std::cerr << "Expected at least 1 prompt token\n";
         exit(EXIT_FAILURE);
     }
 
@@ -50,7 +50,7 @@ void generate(Transformer& transformer, Tokenizer& tokenizer, const std::string&
         if (start == 0) start = time_in_ms();
     }
 
-    std::cout << std::endl;
+    std::cout << "\n";
 
     if (pos > 1) {
         long end = time_in_ms();
