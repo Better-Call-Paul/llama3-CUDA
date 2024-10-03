@@ -7,3 +7,4 @@
 llama3/
 build/
 Meta-Llama-3-8B/*
+cmake-3.25.1-Linux-x86_64.sh

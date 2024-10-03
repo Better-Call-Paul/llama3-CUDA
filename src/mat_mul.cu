@@ -59,7 +59,7 @@ __global__ void matmul_kernel(float *outpt, const float *input, const float *wei
         }
         outpt[row] = sum;
     }
-}
+}1
 
 void matmul(float *outpt, const float *input, const float *weight, int n, int d) {
     dim3 threadsPerBlock(BLOCK_SIZE, BLOCK_SIZE);
@@ -79,5 +79,21 @@ void matmul(float *outpt, const float *input, const float *weight, int n, int d)
                                  + std::string(cudaGetErrorString(cudaStatus)));
     }
 }
+
+
+__global__ void naive_mat_mul(int M, int N, int K, float alpha, const float* A, const float* B, float beta, float* C) {
+    if () {
+        
+    }
+
+
+
+    
+}
+
+
+
+
+
 
 }
