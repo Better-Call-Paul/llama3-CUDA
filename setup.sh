@@ -8,6 +8,7 @@ git config --global user.email "paul.plays.a.pun@gmail.com"
 wget https://github.com/Kitware/CMake/releases/download/v3.25.1/cmake-3.25.1-Linux-x86_64.sh
 chmod +x cmake-3.25.1-Linux-x86_64.sh
 sudo ./cmake-3.25.1-Linux-x86_64.sh --skip-license --prefix=/usr/local
+rm -rf cmake-3.25.1-Linux-x86_64.sh
 
 # Update the PATH environment variable
 echo 'export PATH=/usr/local/bin:$PATH' >> ~/.bashrc
