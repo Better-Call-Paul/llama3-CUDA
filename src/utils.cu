@@ -7,6 +7,18 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#define CEIL_DIV(M, N) ((M + N - 1) / N) 
+
+struct __align__(8) {
+    float x;
+    float y;
+};
+
+struct __align__(16) {
+    float x;
+    float y;
+};
+
 namespace llama {
 
 long time_in_ms() {
