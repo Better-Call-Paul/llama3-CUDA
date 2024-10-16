@@ -16,9 +16,7 @@ include_directories(${CUTLASS_DIR}/include)
 
 set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS};-arch=sm_60)
 
-add_executable(LLAMA3_CUDA src/main.cu src/bpe_tokenizer.cu 
-    src/mat_mul.cu src/multi_head_attention.cu src/rms_norm.cu 
-    src/rope_rotation.cu src/softmax.cu src/transformer.cu src/utils.cu)
+add_executable(LLAMA3_CUDA src/main.cu)
 
 # Using `set_property` to specify CUDA architectures is good.
 set_property(TARGET LLAMA3_CUDA PROPERTY CUDA_ARCHITECTURES 60 61 70 75 80 86)

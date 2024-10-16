@@ -7,6 +7,14 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#define CUDA_CHECK(val) {                               \
+    if (val != cudaSuccess) {                           \
+        fprintf(stderr, "Cuda Error ")                  \
+        fflush(stderr);                                 \
+        exit(val);                                      \
+    }                                                   \
+}                                                       \
+
 #define CEIL_DIV(M, N) ((M + N - 1) / N) 
 
 struct __align__(8) {
@@ -37,10 +45,6 @@ int sample_argmax(float* probabilities, int n) {
         }
     }
     return max_i;
-}
-
-int divUp(int a, int b) {
-    return (a - 1) / b + 1;
 }
 
 void* safeMalloc(size_t size) {
