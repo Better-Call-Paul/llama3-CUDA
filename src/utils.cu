@@ -17,12 +17,16 @@
 
 #define CEIL_DIV(M, N) ((M + N - 1) / N) 
 
-struct __align__(8) {
+
+/*
+ * Align value is bytes
+ */
+struct __align__(8) Aligned_8_Struct {
     float x;
     float y;
 };
 
-struct __align__(16) {
+struct __align__(16) Aligned_16_Struct {
     float x;
     float y;
 };

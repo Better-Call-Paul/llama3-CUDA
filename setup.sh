@@ -18,3 +18,5 @@ source ~/.bashrc
 aws s3 sync s3://llama3-cuda/Meta-Llama-3-8B/ ./Meta-Llama-3-8B
 
 echo "Installation and configuration complete!"
+
+mkdir build

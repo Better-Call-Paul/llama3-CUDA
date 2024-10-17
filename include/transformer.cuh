@@ -7,6 +7,7 @@
 #include <vector>
 
 namespace llama {
+    /*
 
 struct Config {
     int dim;
@@ -97,7 +98,7 @@ private:
     size_t file_size; // for checkpoint file in bytes
 };
 
-
+*/
 
 } 
 #endif 

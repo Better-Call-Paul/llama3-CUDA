@@ -24,7 +24,7 @@ void generate_loop() {
 
 int main(int argc, char *argv[]) {
 
-
+    std::cout << "Stable" << "\n";
     // 32 layers 
 
 

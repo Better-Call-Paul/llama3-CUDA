@@ -1,13 +1,9 @@
-//#include "softmax.cuh"
+#include "softmax.cuh"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cfloat>
 
 namespace llama {
-
-// Define constants
-#define FULL_MASK 0xFFFFFFFF
-#define WARP_SIZE 32
 
 // Warp reduce sum
 __device__ float warp_reduce_sum(float sum) {
@@ -89,13 +85,13 @@ __global__ void softmax(const uint M, const uint K, const __half* __restrict__ i
     input += row * K;
     output += row * K;
 
-    int tid = threadIdx.x;
-    int total_threads = blockDim.x; // stride for better GMEM coalescing 
+    const uint tid = threadIdx.x;
+    const uint total_threads = blockDim.x; // stride for better GMEM coalescing 
 
     float max_val = -FLT_MAX;
 
     // Compute partial maxes
-    for (int i = tid; i < K; i += total_threads) {
+    for (uint i = tid; i < K; i += total_threads) {
         float val = __half2float(input[i]);
         max_val = fmaxf(max_val, val);
     }
@@ -105,20 +101,20 @@ __global__ void softmax(const uint M, const uint K, const __half* __restrict__ i
     
     float sum_exponents = 0.0f;
     // Compute partial sums of exponentials
-    for (int i = tid; i < K; i += total_threads) {
+    for (uint i = tid; i < K; i += total_threads) {
         float curr_val = __half2float(input[i]);
-        float exponent = expf(curr_val - max_val);
+        float exponent = __expf(curr_val - max_val);
         sum_exponents += exponent;
         output[i] = exponent; 
     }
 
     // Find the sum of exponentials using block reduction
     sum_exponents = block_reduce_sum(sum_exponents, shmem);
-    
-    __syncthreads(); // Ensure all exponentials are computed before normalization
 
+    __syncthreads();
+    
     // Normalize the exponentials to get softmax probabilities
-    for (int i = tid; i < K; i += total_threads) {
+    for (uint i = tid; i < K; i += total_threads) {
         output[i] /= sum_exponents;
     }
 

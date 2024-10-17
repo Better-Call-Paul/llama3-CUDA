@@ -2,6 +2,9 @@
 #include <string>
 #include <stdexcept>
 #include <iostream>
+#include <cuda_runtime.h>
+#include <cfloat>
+#include <cuda_fp16.h>
 
 namespace llama {
     
