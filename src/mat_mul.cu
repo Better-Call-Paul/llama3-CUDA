@@ -4,12 +4,17 @@
 #include <iostream>
 #include <cuda_runtime.h>
 #include <cfloat>
-#include <cuda_fp16.h>
+#include <mma.h>
+
+using namespace nvcuda::mma;
 
 namespace llama {
+
+
+
     
 template<const uint block_size_M, const uint block_size_N, const uint block_size_K, const uint tile_size_M, const uint tile_size_N>
-__global__ void half_gemm(int N, int M, int K, float alpha, const float *A, const float *B, float beta, float *C) {
+__global__ void half_gemm(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
 
     const uint cRow = blockIdx.y;
     const uint cCol = blockIdx.x;
