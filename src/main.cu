@@ -134,17 +134,17 @@ __global__ void wmma_gemm(int M, int N, int K, float alpha, const __half* A, con
 // host gemm kernel caller
 
 void matmul(half *x, half *w, float *output, int M, int N, int K) {
-    // input is a vec so N is always 1
-    const uint BK = 8;
+    const uint BK = 16;
     const uint BN = (M >= 128 && N >= 128) ? 128 : 64;
     const uint BM = (M >= 128 && N >= 128) ? 128 : 64;
-    const uint TM = 8
-    const uint TN = 8;
 
-    dim3 gridDim = (CEIL_DIV(N, BN), CEIL_DIV(M, BM));
-    dim3 blockDim = ((BM * BN) / (TM * TN));
+    dim3 gridDim((N + BN - 1) / BN, (M + BM - 1) / BM);
+    dim3 blockDim(BM / WMMA_M, BN / WMMA_N);
+
+    size_t shared_memory_size = BM * BK * sizeof(__half) + BK * BN * sizeof(__half);
+
     wmma_gemm<BM, BN, BK>
-    <<<gridDim, blockDim>>>(M, N, K, 1.0f, x, w, 1.0f, output);
+        <<<gridDim, blockDim, shared_memory_size>>>(M, N, K, 1.0f, x, w, 1.0f, output);
 }
 
 // Warp reduce sum
