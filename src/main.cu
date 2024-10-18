@@ -15,6 +15,16 @@
 
 using namespace nvcuda::mma;
 
+#define CUDA_CHECK(val) {                               \
+    if (val != cudaSuccess) {                           \
+        fprintf(stderr, "Cuda Error ")                  \
+        fflush(stderr);                                 \
+        exit(val);                                      \
+    }                                                   \
+}                                                       \
+
+#define CEIL_DIV(M, N) ((M + N - 1) / N) 
+
 
 // ----------------------------------------------------------------------------
 // Kernels
