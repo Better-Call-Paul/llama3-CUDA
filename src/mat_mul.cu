@@ -51,7 +51,7 @@ __global__ void wmma_gemm(int M, int N, int K, float alpha, const __half* A, con
             int a_col = aTileCol;
             if (a_row < M && a_col < K) {
                 A_shared[(threadIdx.y * WMMA_M + i) * BK + threadIdx.x * WMMA_K] =
-                    A_block[a_row * lda + a_col];
+                    A[a_row * lda + a_col];
             } else {
                 A_shared[(threadIdx.y * WMMA_M + i) * BK + threadIdx.x * WMMA_K] = __float2half(0.0f);
             }
@@ -63,7 +63,7 @@ __global__ void wmma_gemm(int M, int N, int K, float alpha, const __half* A, con
             int b_col = globalCol;
             if (b_row < K && b_col < N) {
                 B_shared[(threadIdx.y * WMMA_K + i) * BN + threadIdx.x * WMMA_N] =
-                    B_block[b_row * ldb + b_col];
+                    B[b_row * ldb + b_col];
             } else {
                 B_shared[(threadIdx.y * WMMA_K + i) * BN + threadIdx.x * WMMA_N] = __float2half(0.0f);
             }
