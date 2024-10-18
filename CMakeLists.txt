@@ -9,7 +9,6 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 find_package(CUDA REQUIRED)
 
-
 set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS};-arch=sm_60)
 
 file(GLOB_RECURSE SOURCES "src/*.cu")
