@@ -1,4 +1,4 @@
-// transformer_inference.cu
+// transformer inference
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -13,26 +13,129 @@
 #include <cstring>
 #include <cfloat>
 
-// Use the WMMA namespace for convenience
-using namespace nvcuda::wmma;
+using namespace nvcuda::mma;
 
-// Constants
-#define FULL_MASK 0xFFFFFFFF
-#define WARP_SIZE 32
-#define WMMA_M 16
-#define WMMA_N 16
-#define WMMA_K 16
 
-// Error checking macro
-#define CUDA_CHECK(val) { \
-    cudaError_t err = (val); \
-    if (err != cudaSuccess) { \
-        throw std::runtime_error(std::string("CUDA Error ") + std::to_string(err) + ": " + cudaGetErrorString(err) + " at " + __FILE__ + ":" + std::to_string(__LINE__)); \
-    } \
+// ----------------------------------------------------------------------------
+// Kernels
+// ----------------------------------------------------------------------------
+
+const int num_threads_large = 1024;
+const int num_threads_small = 64;
+
+template<const uint BM, const uint BN, const uint BK>
+__global__ void wmma_gemm(int M, int N, int K, float alpha, const __half* A, const __half *B, float beta, float *C) {
+
+    // get block positions
+    const uint cRow = blockIdx.y;
+    const uint cCol = blockIdx.x;
+
+    // global position
+    const uint globalRow = threadIdx.y * WMMA_M;
+    const uint globalCol = threadIdx.x * WMMA_N;
+
+    // move matrices to current block
+    A += cRow * BM * K;
+    B += cCol * BN;
+    C += cRow * BM * N + cCol * BN;
+
+    // initialize output fragments
+    fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+    fill_fragment(c_frag, 0.0f);
+
+    extern __shared__ __half shared_mem[];
+    __half* A_shared = shared_mem;
+    __half* B_shared = shared_mem + BM * BK;
+
+
+    // loop with stride for gmem coalescing
+    for (int tileIdx = 0; tileIdx < CEIL_DIV(K, WMMA_K); tileIdx++) {
+        
+       // Calculate the starting indices for A and B
+        int aTileRow = threadIdx.y * WMMA_M;
+        int aTileCol = tileIdx * WMMA_K + threadIdx.x * WMMA_K;
+
+        int bTileRow = tileIdx * WMMA_K + threadIdx.y * WMMA_K;
+        int bTileCol = threadIdx.x * WMMA_N;
+
+        // Load A tile into shared memory
+        for (int i = 0; i < WMMA_M; ++i) {
+            int a_row = globalRow + i;
+            int a_col = aTileCol;
+            if (a_row < M && a_col < K) {
+                A_shared[(threadIdx.y * WMMA_M + i) * BK + threadIdx.x * WMMA_K] =
+                    A[a_row * lda + a_col];
+            } else {
+                A_shared[(threadIdx.y * WMMA_M + i) * BK + threadIdx.x * WMMA_K] = __float2half(0.0f);
+            }
+        }
+
+        // Load B tile into shared memory
+        for (int i = 0; i < WMMA_K; ++i) {
+            int b_row = bTileRow + i;
+            int b_col = globalCol;
+            if (b_row < K && b_col < N) {
+                B_shared[(threadIdx.y * WMMA_K + i) * BN + threadIdx.x * WMMA_N] =
+                    B[b_row * ldb + b_col];
+            } else {
+                B_shared[(threadIdx.y * WMMA_K + i) * BN + threadIdx.x * WMMA_N] = __float2half(0.0f);
+            }
+        }
+
+        __syncthreads();
+
+        fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, row_major> a_frag;
+        fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, row_major> b_frag;
+
+        // load inputs into fragments
+        // frag, mem input, col size
+        load_matrix_sync(a_frag, A_shared, BK);
+        load_matrix_sync(b_frag, B_shared, BN);
+
+        mma_sync(c_frag, a_frag, b_frag, c_frag);
+
+        __syncthreads();
+        // dot prod
+    }
+
+    // Initialize C_frag with beta * C
+    for (int i = 0; i < c_frag.num_elements; ++i) {
+        int c_row = globalRow + (i / WMMA_N);
+        int c_col = globalCol + (i % WMMA_N);
+        if (c_row < M && c_col < N) {
+            // Assuming row-major order for C
+            c_frag.x[i] += beta * C_block[c_row * ldc + c_col];
+        }
+    }
+
+    // Scale by alpha and store the result back to C_block
+    for (int i = 0; i < WMMA_M; ++i) {
+        for (int j = 0; j < WMMA_N; ++j) {
+            int c_row = globalRow + i;
+            int c_col = globalCol + j;
+            if (c_row < M && c_col < N) {
+                C_block[c_row * ldc + c_col] = alpha * c_frag.x[i * WMMA_N + j];
+            }
+        }
+    }
+    // load into c
 }
 
-// Namespace for custom kernels and functions
-namespace llama {
+// host gemm kernel caller
+
+void matmul(half *x, half *w, float *output, int M, int N, int K) {
+    // input is a vec so N is always 1
+    const uint BK = 8;
+    const uint BN = (M >= 128 && N >= 128) ? 128 : 64;
+    const uint BM = (M >= 128 && N >= 128) ? 128 : 64;
+    const uint TM = 8
+    const uint TN = 8;
+
+    dim3 gridDim = (CEIL_DIV(N, BN), CEIL_DIV(M, BM));
+    dim3 blockDim = ((BM * BN) / (TM * TN));
+    wmma_gemm<BM, BN, BK>
+    <<<gridDim, blockDim>>>(M, N, K, 1.0f, x, w, 1.0f, output);
+}
 
 // Warp reduce sum
 __device__ float warp_reduce_sum(float sum) {
@@ -103,7 +206,7 @@ __device__ float block_reduce_max(float max_val, float* shmem) {
 /*
  * M x K Matrix Softmax Kernel
  */
-__global__ void softmax_kernel(const uint M, const uint K, const __half* __restrict__ input, float* __restrict__ output) {
+__global__ void softmax(const uint K, const float* __restrict__ input) {
     
     extern __shared__ float shmem[];
 
@@ -121,8 +224,7 @@ __global__ void softmax_kernel(const uint M, const uint K, const __half* __restr
 
     // Compute partial maxes
     for (uint i = tid; i < K; i += total_threads) {
-        float val = __half2float(input[i]);
-        max_val = fmaxf(max_val, val);
+        max_val = fmaxf(max_val, input[i]);
     }
 
     // Find global max using block reduction
@@ -131,10 +233,9 @@ __global__ void softmax_kernel(const uint M, const uint K, const __half* __restr
     float sum_exponents = 0.0f;
     // Compute partial sums of exponentials
     for (uint i = tid; i < K; i += total_threads) {
-        float curr_val = __half2float(input[i]);
-        float exponent = __expf(curr_val - max_val);
+        float exponent = __expf(input[i] - max_val);
         sum_exponents += exponent;
-        output[i] = exponent; 
+        input[i] = exponent; 
     }
 
     // Find the sum of exponentials using block reduction
@@ -144,748 +245,493 @@ __global__ void softmax_kernel(const uint M, const uint K, const __half* __restr
     
     // Normalize the exponentials to get softmax probabilities
     for (uint i = tid; i < K; i += total_threads) {
-        output[i] /= sum_exponents;
+        input[i] /= sum_exponents;
     }
-
 }
 
-/*
- * WMMA GEMM Kernel
- */
-__global__ void wmma_gemm_kernel(int M, int N, int K, float alpha, const __half* A, const __half* B, float beta, float* C) {
-
-    // Define the shape of the tile
-    // Each block handles one tile of the output matrix
-
-    // Identify the tile row and tile column
-    int tileRow = blockIdx.y;
-    int tileCol = blockIdx.x;
-
-    // Declare the fragments
-    fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> C_frag;
-    fill_fragment(C_frag, 0.0f);
-
-    fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, row_major> A_frag;
-    fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, row_major> B_frag;
-
-    // Loop over tiles of K dimension
-    for(int t = 0; t < K; t += WMMA_K) {
-        // Load the inputs
-        const __half* A_tile = A + tileRow * WMMA_M * K + t * WMMA_K;
-        const __half* B_tile = B + t * WMMA_K * N + tileCol * WMMA_N;
-
-        load_matrix_sync(A_frag, A_tile, K);
-        load_matrix_sync(B_frag, B_tile, N);
-
-        // Perform the matrix multiplication
-        mma_sync(C_frag, A_frag, B_frag, C_frag);
+template<const uint size>
+__global__ void rms_norm_kernel(float* __restrict__ input, float* __restrict__ weight, float* __restrict__ output, const uint elements_per_thread, const uint stride) {
+    // square all vals in curr tile
+    float ss = 0.0f;
+    for (uint i = 0; i < elements_per_thread; ++i) {
+        const uint curr_index = threadIdx.x + i * stride;
+        if (curr_index < size) {
+            ss += input[curr_index] * input[curr_index];
+        }
     }
 
-    // Load the C tile from memory
-    float* C_tile = C + tileRow * WMMA_M * N + tileCol * WMMA_N;
-    fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> D_frag;
-    load_matrix_sync(D_frag, C_tile, N);
-
-    // Apply alpha and beta scaling
-    for(int i = 0; i < C_frag.num_elements; i++) {
-        C_frag.x[i] = alpha * C_frag.x[i] + beta * D_frag.x[i];
-    }
-
-    // Store the result back to C
-    store_matrix_sync(C_tile, C_frag, N, mem_row_major);
-}
-
-/*
- * RMSNorm Kernel
- */
-__global__ void rmsnorm_kernel(float* o, const float* x, const float* weight, int size) {
     extern __shared__ float shmem[];
 
-    // Compute the sum of squares
-    float ss = 0.0f;
-    for(int i = threadIdx.x; i < size; i += blockDim.x){
-        ss += x[i] * x[i];
-    }
-
-    // Block reduction to compute total sum of squares
     ss = block_reduce_sum(ss, shmem);
 
-    // Compute normalization factor
-    float norm = 1.0f / sqrtf(ss / size + 1e-5f);
+    __shared__ float global_ss;
 
-    // Normalize and scale
-    for(int i = threadIdx.x; i < size; i += blockDim.x){
-        o[i] = weight[i] * (x[i] * norm);
+    if (threadIdx.x == 0) {
+        ss /= size;
+        // avoid calling sqrt on negative value
+        ss += 1e-5f;
+        ss = 1.0f / sqrtf(ss);
+        global_ss = ss;
+    }
+
+    __syncthreads();
+    ss = global_ss;
+
+    for (int i = 0; i < elements_per_thread; ++i) {
+        int index = threadIdx.x + i * stride;
+        if (index < size) {
+            output[index] = weight[index] * (ss * input[index]);
+        }
     }
 }
 
-/*
- * Element-wise addition kernel: C = A + B
- */
-__global__ void add_elements_kernel(float* C, const float* A, const float* B, int size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if(idx < size){
-        C[idx] = A[idx] + B[idx];
+void rms_norm(float* output, float *input, float* weight, uint size) {
+    uint elements_per_thread = CEIL_DIV(size, num_threads_large);
+    rms_norm_kernel<size>
+    <<<1, num_threads_large>>>(input, weight, output, elements_per_thread, num_threads_large);
+}
+
+
+
+
+
+// ----------------------------------------------------------------------------
+// Transformer model
+// ----------------------------------------------------------------------------
+typedef struct {
+    int dim;            // D
+    int hidden_dim;     // DD
+    int n_layers;       // NL
+    int n_heads;        // QHN, HN, HD = 48
+    int n_kv_heads;     // KVHN = 6
+    int vocab_size;     // VS
+    int max_seq_len;    // M
+} Config;
+
+// CUDA NOTE: The TransformerWeights structure will be stored on the host,
+// but all the pointers in the structure will point to data on the GPU.
+// The checkpoint file is mmap-ed to the host and the weights portion
+// is allocated on and copied to the GPU. Then, `memory_map_weights()` updates
+// these structure pointers to point to the proper location. Happily, this
+// function is the same for both C and CUDA.
+typedef struct {
+    float *token_embedding;     // (VS, D)
+    float *rms_att_weight;      // (NL, D)
+    float *wq;                  // (NL, D, D)
+    float *wk;                  // (NL, D, D)
+    float *wv;                  // (NL, D, D)
+    float *wo;                  // (NL, D, D)
+    float *rms_ffn_weight;      // (NL, D)
+    float *w1;                  // (NL, DD, D)
+    float *w2;                  // (NL, D, DD)
+    float *w3;                  // (NL, DD, D)
+    float *rms_final_weight;    // (D,)
+    // (optional) classifier weights for the logits, on the last layer
+    float *wcls;
+} TransformerWeights;
+
+// CUDA NOTE: The RunState structure will be stored on the host, but all the
+// pointers in the structure will point to data on the GPU, created via
+// cudaMalloc. The exception is logits which is the final result of the
+// transformer & is copied from the GPU as the last step in the transformer
+// and is used by the host.
+typedef struct {
+    // current wave of activations
+    float *x;           // (D,) activation at current time stamp
+    float *xb;          // (D,) same, but inside a residual branch
+    float *xb2;         // (D,) an additional buffer just for convenience
+    float *hb;          // (DD,) buffer for hidden dimension in the ffn
+    float *hb2;         // (DD,) buffer for hidden dimension in the ffn
+    float *q;           // (D,) query
+    float *k;           // (D,) key
+    float *v;           // (D,) value
+    float *att;         // (HN, M) buffer for scores/attention values
+    float *logits_gpu;  // output logits in GPU
+    float *logits;      // output logits in CPU
+    // kv cache
+    float *key_cache;   // (NL, M, D)
+    float *value_cache; // (NL, M, D)
+} RunState;
+
+typedef struct {
+    Config config;              // the hyperparameters of the architecture (the blueprint)
+    TransformerWeights weights; // the weights of the model
+    RunState state;             // buffers for the "wave" of activations in the forward pass
+    // some more state needed to properly clean up the memory mapping (sigh)
+    int fd;                     // file descriptor for memory mapping
+    float *data;                // memory mapped data pointer
+    ssize_t file_size;          // size of the checkpoint file in bytes
+} Transformer;
+
+void malloc_run_state(RunState *s, Config *p) {
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    CUDA_CHECK(cudaMalloc((void **) &s->x, p->dim * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void **) &s->xb, p->dim * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void **) &s->xb2, p->dim * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void **) &s->hb, p->hidden_dim * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void **) &s->hb2, p->hidden_dim * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void **) &s->q, p->dim * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void **) &s->key_cache, p->n_layers * p->max_seq_len * kv_dim * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void **) &s->value_cache, p->n_layers * p->max_seq_len * kv_dim * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void **) &s->att, p->n_heads * p->max_seq_len * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void **) &s->logits_gpu, p->vocab_size * sizeof(float)));
+    // we calloc instead of malloc to keep valgrind happy
+    s->logits = (float *) calloc(p->vocab_size, sizeof(float));
+
+    // ensure all cudaMallocs went fine
+    if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
+        || !s->key_cache || !s->value_cache || !s->att || !s->logits_gpu || !s->logits) {
+        fprintf(stderr, "cudaMalloc failed!\n");
+        exit(EXIT_FAILURE);
     }
 }
 
-/*
- * Weighted sum kernel: xb = sum(att * v) for each head
- */
-__global__ void weighted_sum_kernel(float* xb, const float* att, const float* v, int n_heads, int max_seq_len, int kv_dim, int head_size) {
-    int head = blockIdx.x;
-    int idx = threadIdx.x;
+void free_run_state(RunState *s) {
+    CUDA_CHECK(cudaFree(s->x));
+    CUDA_CHECK(cudaFree(s->xb));
+    CUDA_CHECK(cudaFree(s->xb2));
+    CUDA_CHECK(cudaFree(s->hb));
+    CUDA_CHECK(cudaFree(s->hb2));
+    CUDA_CHECK(cudaFree(s->q));
+    CUDA_CHECK(cudaFree(s->att));
+    CUDA_CHECK(cudaFree(s->logits_gpu));
+    free(s->logits);
+    CUDA_CHECK(cudaFree(s->key_cache));
+    CUDA_CHECK(cudaFree(s->value_cache));
+}
 
-    if(head >= n_heads || idx >= head_size){
-        return;
+void memory_map_weights(TransformerWeights *w, Config *p, float *ptr, int shared_weights) {
+    int head_size = p->dim / p->n_heads;
+    // make sure the multiplications below are done in 64bit to fit the parameter counts of 13B+ models
+    unsigned long long n_layers = p->n_layers;
+    w->token_embedding = ptr;
+    ptr += p->vocab_size * p->dim;
+    w->rms_att_weight = ptr;
+    ptr += n_layers * p->dim;
+    w->wq = ptr;
+    ptr += n_layers * p->dim * (p->n_heads * head_size);
+    w->wk = ptr;
+    ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
+    w->wv = ptr;
+    ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
+    w->wo = ptr;
+    ptr += n_layers * (p->n_heads * head_size) * p->dim;
+    w->rms_ffn_weight = ptr;
+    ptr += n_layers * p->dim;
+    w->w1 = ptr;
+    ptr += n_layers * p->dim * p->hidden_dim;
+    w->w2 = ptr;
+    ptr += n_layers * p->hidden_dim * p->dim;
+    w->w3 = ptr;
+    ptr += n_layers * p->dim * p->hidden_dim;
+    w->rms_final_weight = ptr;
+    ptr += p->dim;
+    ptr += p->max_seq_len * head_size / 2; // skip what used to be freq_cis_real (for RoPE)
+    ptr += p->max_seq_len * head_size / 2; // skip what used to be freq_cis_imag (for RoPE)
+    w->wcls = shared_weights ? w->token_embedding : ptr;
+}
+
+void read_checkpoint(char *checkpoint, Config *config, TransformerWeights *weights,
+                     int *fd, float **data, ssize_t *file_size) {
+    FILE *file = fopen(checkpoint, "rb");
+    if (!file) {
+        fprintf(stderr, "Couldn't open file %s\n", checkpoint);
+        exit(EXIT_FAILURE);
     }
-
-    float sum = 0.0f;
-    for(int t = 0; t < max_seq_len; t++){
-        float a = att[head * max_seq_len + t];
-        float val = v[head * max_seq_len * kv_dim + t * kv_dim + idx];
-        sum += a * val;
+    // read in the config header
+    if (fread(config, sizeof(Config), 1, file) != 1) { exit(EXIT_FAILURE); }
+    // negative vocab size is hacky way of signaling unshared weights. bit yikes.
+    int shared_weights = config->vocab_size > 0 ? 1 : 0;
+    config->vocab_size = abs(config->vocab_size);
+    // figure out the file size
+    fseek(file, 0, SEEK_END); // move file pointer to end of file
+    *file_size = ftell(file); // get the file size, in bytes
+    fclose(file);
+    // memory map the Transformer weights into the data pointer
+    *fd = open(checkpoint, O_RDONLY); // open in read only mode
+    if (*fd == -1) {
+        fprintf(stderr, "open failed!\n");
+        exit(EXIT_FAILURE);
     }
-
-    xb[head * head_size + idx] = sum;
-}
-
-/*
- * SiLU Activation and Element-Wise Multiplication
- */
-__global__ void silu_elementwise_mul_kernel(float* hb, const float* hb2, int hidden_dim) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if(idx < hidden_dim){
-        float silu = hb[idx] * (1.0f / (1.0f + expf(-hb[idx])));
-        hb[idx] = silu * hb2[idx];
+    *data = (float *) mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
+    if (*data == MAP_FAILED) {
+        fprintf(stderr, "mmap failed!\n");
+        exit(EXIT_FAILURE);
     }
+    // allocate & copy mmap data to the gpu first
+    // to fit in the GPU, then copy the data only as needed while running.
+    float *weights_ptr;
+    size_t weights_size = *file_size - sizeof(Config);
+    CUDA_CHECK(cudaMalloc((void **) &weights_ptr, weights_size));
+    CUDA_CHECK(cudaMemcpy(weights_ptr, *data + sizeof(Config) / sizeof(float), weights_size, cudaMemcpyHostToDevice));
+    memory_map_weights(weights, config, weights_ptr, shared_weights);
 }
 
-/*
- * Float to Half Conversion Kernel
- */
-__global__ void float_to_half_kernel(const float* __restrict__ input, __half* __restrict__ output, int size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if(idx < size){
-        output[idx] = __float2half(input[idx]);
-    }
+void build_transformer(Transformer *t, char *checkpoint_path) {
+    // read in the Config and the Weights from the checkpoint
+    read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
+    // allocate the RunState buffers
+    malloc_run_state(&t->state, &t->config);
 }
 
-/*
- * Half to Float Conversion Kernel
- */
-__global__ void half_to_float_kernel(const __half* __restrict__ input, float* __restrict__ output, int size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if(idx < size){
-        output[idx] = __half2float(input[idx]);
-    }
+void free_transformer(Transformer *t) {
+    // close the memory mapping
+    if (t->data != MAP_FAILED) { munmap(t->data, t->file_size); }
+    if (t->fd != -1) { close(t->fd); }
+    // we cudaMalloc a region of memory, then hand the address to
+    // the token_embedding field. Free it here.
+    CUDA_CHECK(cudaFree(t->weights.token_embedding));
+    // free the RunState buffers
+    free_run_state(&t->state);
 }
 
-// Host functions to launch kernels
+// ----------------------------------------------------------------------------
+// The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
+// ----------------------------------------------------------------------------
+typedef struct {
+    char *str;
+    int id;
+} TokenIndex;
 
-void softmax(const uint M, const uint K, const __half* input, float* output) {
-    // Assuming block size is 256 threads
-    int threads = 256;
-    int blocks = M;
-    size_t shared_mem = threads * sizeof(float);
-    softmax_kernel<<<blocks, threads, shared_mem>>>(M, K, input, output);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-}
-
-void wmma_gemm(int M, int N, int K, float alpha, const __half* A, const __half* B, float beta, float* C) {
-    dim3 grid((N + WMMA_N - 1)/WMMA_N, (M + WMMA_M - 1)/WMMA_M);
-    dim3 block(1,1);
-    wmma_gemm_kernel<<<grid, block>>>(M, N, K, alpha, A, B, beta, C);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-}
-
-void rmsnorm_custom(float* o, const float* x, const float* weight, int size) {
-    int threads = 256;
-    int blocks = 1;
-    size_t shared_mem = (threads / WARP_SIZE) * sizeof(float);
-    rmsnorm_kernel<<<blocks, threads, shared_mem>>>(o, x, weight, size);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-}
-
-void add_elements(float* C, const float* A, const float* B, int size) {
-    int threads = 256;
-    int blocks = (size + threads - 1) / threads;
-    add_elements_kernel<<<blocks, threads>>>(C, A, B, size);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-}
-
-void weighted_sum(float* xb, const float* att, const float* v, int n_heads, int max_seq_len, int kv_dim, int head_size) {
-    dim3 grid(n_heads);
-    dim3 block(head_size);
-    weighted_sum_kernel<<<grid, block>>>(xb, att, v, n_heads, max_seq_len, kv_dim, head_size);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-}
-
-void silu_elementwise_mul(float* hb, const float* hb2, int hidden_dim) {
-    int threads = 256;
-    int blocks = (hidden_dim + threads -1)/threads;
-    silu_elementwise_mul_kernel<<<blocks, threads>>>(hb, hb2, hidden_dim);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-}
-
-void convert_float_to_half(const float* d_input, __half* d_output, int size) {
-    int threads = 256;
-    int blocks = (size + threads - 1) / threads;
-    float_to_half_kernel<<<blocks, threads>>>(d_input, d_output, size);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-}
-
-void convert_half_to_float(const __half* d_input, float* d_output, int size) {
-    int threads = 256;
-    int blocks = (size + threads - 1) / threads;
-    half_to_float_kernel<<<blocks, threads>>>(d_input, d_output, size);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-}
-
-} // namespace llama
-
-// Data structures
-
-struct Config {
-    int dim;
-    int hidden_dim;
-    int n_layers;
-    int n_heads;
-    int n_kv_heads;
+typedef struct {
+    char **vocab;
+    float *vocab_scores;
+    TokenIndex *sorted_vocab;
     int vocab_size;
-    int max_seq_len;
-};
+    unsigned int max_token_length;
+    unsigned char byte_pieces[512]; // stores all single-byte strings
+} Tokenizer;
 
-struct TransformerWeights {
-    float* token_embedding;     
-    float* rms_att_weight;      
-    float* wq;                  
-    float* wk;                  
-    float* wv;                  
-    float* wo;                  
-    float* rms_ffn_weight;      
-    float* w1;                  
-    float* w2;                  
-    float* w3;                  
-    float* rms_final_weight;    
-    float* wcls;
-};
-
-struct RunState {
-    float* x;
-    float* xb;
-    float* xb2;
-    float* hb;
-    float* hb2;
-    float* q;
-    float* k;
-    float* v;
-    float* att;
-    float* logits_gpu;
-    float* logits; // Host-side
-    float* key_cache;
-    float* value_cache;
-};
-
-// Tokenizer class
-class Tokenizer {
-public:
-    Tokenizer(const std::string& tokenizer_path, int vocab_size);
-    ~Tokenizer();
-
-    std::vector<int> encode(const std::string& text, bool bos = true, bool eos = true);
-    std::string decode(int prev_token, int token) const;
-
-private:
-    void build_tokenizer(const std::string& tokenizer_path, int vocab_size);
-    int str_lookup(const std::string& str) const;
-    void sort_vocab();
-
-    std::vector<std::string> vocab_;
-    std::vector<float> vocab_scores_;
-    std::vector<std::pair<std::string, int>> sorted_vocab_;
-    int vocab_size_;
-    unsigned int max_token_length_;
-    unsigned char byte_pieces_[512];
-};
-
-Tokenizer::Tokenizer(const std::string& tokenizer_path, int vocab_size)
-    : vocab_size_(vocab_size), max_token_length_(0) {
-    // Initialize byte_pieces
-    for(int i =0; i<256; i++) {
-        byte_pieces_[i *2] = static_cast<unsigned char>(i);
-        byte_pieces_[i *2 +1] = '\0';
-    }
-
-    build_tokenizer(tokenizer_path, vocab_size);
+int compare_tokens(const void *a, const void *b) {
+    return strcmp(((TokenIndex *) a)->str, ((TokenIndex *) b)->str);
 }
 
-Tokenizer::~Tokenizer() {
-    // Nothing to free
+void build_tokenizer(Tokenizer *t, char *tokenizer_path, int vocab_size) {
+    // i should have written the vocab_size into the tokenizer file... sigh
+    t->vocab_size = vocab_size;
+    // malloc space to hold the scores and the strings
+    t->vocab = (char **) malloc(vocab_size * sizeof(char *));
+    t->vocab_scores = (float *) malloc(vocab_size * sizeof(float));
+    t->sorted_vocab = NULL; // initialized lazily
+    for (int i = 0; i < 256; i++) {
+        t->byte_pieces[i * 2] = (unsigned char) i;
+        t->byte_pieces[i * 2 + 1] = '\0';
+    }
+    // read in the file
+    FILE *file = fopen(tokenizer_path, "rb");
+    if (!file) {
+        fprintf(stderr, "couldn't load %s\n", tokenizer_path);
+        exit(EXIT_FAILURE);
+    }
+    if (fread(&t->max_token_length, sizeof(int), 1, file) != 1) {
+        fprintf(stderr, "failed read\n");
+        exit(EXIT_FAILURE);
+    }
+    int len;
+    for (int i = 0; i < vocab_size; i++) {
+        if (fread(t->vocab_scores + i, sizeof(float), 1, file) != 1) {
+            fprintf(stderr, "failed read\n");
+            exit(EXIT_FAILURE);
+        }
+        if (fread(&len, sizeof(int), 1, file) != 1) {
+            fprintf(stderr, "failed read\n");
+            exit(EXIT_FAILURE);
+        }
+        t->vocab[i] = (char *) malloc(len + 1);
+        if (fread(t->vocab[i], len, 1, file) != 1) {
+            fprintf(stderr, "failed read\n");
+            exit(EXIT_FAILURE);
+        }
+        t->vocab[i][len] = '\0'; // add the string terminating token
+    }
+    fclose(file);
 }
 
-void Tokenizer::build_tokenizer(const std::string& tokenizer_path, int vocab_size) {
-    std::ifstream file(tokenizer_path, std::ios::binary);
-    if(!file.is_open()) {
-        throw std::runtime_error("Couldn't load tokenizer file: " + tokenizer_path);
-    }
-
-    // Read max_token_length
-    file.read(reinterpret_cast<char*>(&max_token_length_), sizeof(int));
-    if(file.fail()) {
-        throw std::runtime_error("Failed to read max_token_length from tokenizer file");
-    }
-
-    vocab_.resize(vocab_size_);
-    vocab_scores_.resize(vocab_size_);
-
-    for(int i = 0; i < vocab_size_; i++) {
-        // Read score
-        file.read(reinterpret_cast<char*>(&vocab_scores_[i]), sizeof(float));
-        if(file.fail()) {
-            throw std::runtime_error("Failed to read vocab score");
-        }
-
-        // Read token length
-        int len;
-        file.read(reinterpret_cast<char*>(&len), sizeof(int));
-        if(file.fail()) {
-            throw std::runtime_error("Failed to read token length");
-        }
-
-        // Read token string
-        std::string token(len, '\0');
-        file.read(&token[0], len);
-        if(file.fail()) {
-            throw std::runtime_error("Failed to read token string");
-        }
-
-        // Store with null terminator
-        token.push_back('\0');
-        vocab_[i] = token;
-    }
-
-    file.close();
-
-    sort_vocab();
+void free_tokenizer(Tokenizer *t) {
+    for (int i = 0; i < t->vocab_size; i++) { free(t->vocab[i]); }
+    free(t->vocab);
+    free(t->vocab_scores);
+    free(t->sorted_vocab);
 }
 
-void Tokenizer::sort_vocab() {
-    sorted_vocab_.reserve(vocab_size_);
-    for(int i =0; i < vocab_size_; i++) {
-        sorted_vocab_.emplace_back(std::make_pair(vocab_[i], i));
+char *decode(Tokenizer *t, int prev_token, int token) {
+    char *piece = t->vocab[token];
+    // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR #89)
+    if (prev_token == 1 && piece[0] == ' ') { piece++; }
+    // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
+    // parse this and convert and return the actual byte
+    unsigned char byte_val;
+    if (sscanf(piece, "<0x%02hhX>", &byte_val) == 1) {
+        piece = (char *) t->byte_pieces + byte_val * 2;
     }
-
-    std::sort(sorted_vocab_.begin(), sorted_vocab_.end(), [&](const std::pair<std::string, int>& a, const std::pair<std::string, int>& b) -> bool {
-        return a.first < b.first;
-    });
-}
-
-int Tokenizer::str_lookup(const std::string& str) const {
-    // Binary search in sorted_vocab_
-    int left = 0;
-    int right = sorted_vocab_.size() -1;
-    while(left <= right) {
-        int mid = left + (right - left)/2;
-        if(sorted_vocab_[mid].first == str) {
-            return sorted_vocab_[mid].second;
-        }
-        else if(sorted_vocab_[mid].first < str) {
-            left = mid +1;
-        }
-        else {
-            right = mid -1;
-        }
-    }
-    return -1;
-}
-
-std::vector<int> Tokenizer::encode(const std::string& text, bool bos, bool eos) {
-    std::vector<int> tokens;
-    if(bos) {
-        tokens.push_back(1); // BOS token
-    }
-
-    // Simplified encoding: split into words and lookup
-    // Implement proper BPE encoding as needed
-
-    std::string current;
-    for(auto c: text) {
-        current += c;
-        int id = str_lookup(current);
-        if(id != -1) {
-            tokens.push_back(id);
-            current.clear();
-        }
-    }
-
-    // Handle remaining
-    if(!current.empty()) {
-        // Byte fallback: encode each byte as token (start at index 3)
-        for(auto c: current) {
-            tokens.push_back(static_cast<unsigned char>(c) + 3);
-        }
-    }
-
-    if(eos) {
-        tokens.push_back(2); // EOS token
-    }
-
-    return tokens;
-}
-
-std::string Tokenizer::decode(int prev_token, int token) const {
-    if(token <0 || token >= vocab_size_){
-        return "";
-    }
-
-    std::string piece = vocab_[token];
-    // Following BOS (1) token, sentencepiece decoder strips any leading whitespace
-    if(prev_token ==1 && piece[0] == ' ') {
-        piece = piece.substr(1);
-    }
-
-    // Handle byte_fallback encoding
-    if(piece.size() ==0){
-        return "";
-    }
-    if(piece.size() ==1){
-        unsigned char byte_val = piece[0];
-        if(!(isprint(byte_val) || isspace(byte_val))){
-            // Return empty string for non-printable
-            return "";
-        }
-    }
-
-    // Check if token is in format <0xXX>
-    if(piece.size() ==7 && piece[0] == '<' && piece[1] == '0' && piece[2] == 'x' && piece[6] == '>'){
-        unsigned char byte_val;
-        sscanf(piece.c_str(), "<0x%02hhX>", &byte_val);
-        return std::string(reinterpret_cast<const char*>(byte_pieces_) + byte_val *2);
-    }
-
     return piece;
 }
 
-// Transformer class
-class Transformer {
-public:
-    Transformer(const std::string& checkpoint_path);
-    ~Transformer();
-
-    float* forward(int token, int pos);
-
-private:
-    void build_transformer(const std::string& checkpoint_path);
-    void malloc_run_state();
-    void free_run_state();
-    void memory_map_weights(__half* ptr, int shared_weights);
-    void read_checkpoint(const std::string& checkpoint_path);
-
-    Config config_;
-    TransformerWeights weights_;
-    RunState state_;
-    int fd_;
-    float* data_;
-    ssize_t file_size_;
-};
-
-Transformer::Transformer(const std::string& checkpoint_path)
-    : fd_(-1), data_(nullptr), file_size_(0) {
-    build_transformer(checkpoint_path);
-    malloc_run_state();
-}
-
-Transformer::~Transformer() {
-    // Free RunState buffers
-    free_run_state();
-
-    // Unmap and close the checkpoint file
-    if(data_ != MAP_FAILED && data_ != nullptr){
-        munmap(data_, file_size_);
-    }
-    if(fd_ != -1){
-        close(fd_);
-    }
-
-    // Free weights (assume allocated as __half*, but stored as float*)
-    cudaFree(weights_.token_embedding);
-    cudaFree(weights_.rms_att_weight);
-    cudaFree(weights_.wq);
-    cudaFree(weights_.wk);
-    cudaFree(weights_.wv);
-    cudaFree(weights_.wo);
-    cudaFree(weights_.rms_ffn_weight);
-    cudaFree(weights_.w1);
-    cudaFree(weights_.w2);
-    cudaFree(weights_.w3);
-    cudaFree(weights_.rms_final_weight);
-    cudaFree(weights_.wcls);
-}
-
-void Transformer::read_checkpoint(const std::string& checkpoint_path) {
-    std::ifstream file(checkpoint_path, std::ios::binary);
-    if(!file.is_open()) {
-        throw std::runtime_error("Couldn't open checkpoint file: " + checkpoint_path);
-    }
-
-    // Read Config
-    file.read(reinterpret_cast<char*>(&config_), sizeof(Config));
-    if(file.fail()){
-        throw std::runtime_error("Failed to read Config from checkpoint");
-    }
-
-    // Determine shared_weights based on vocab_size
-    int shared_weights = config_.vocab_size >0 ?1 :0;
-    config_.vocab_size = abs(config_.vocab_size);
-
-    // Get file size
-    file.seekg(0, std::ios::end);
-    file_size_ = file.tellg();
-    file.seekg(0, std::ios::beg);
-    file.close();
-
-    // Memory map the checkpoint file
-    fd_ = open(checkpoint_path.c_str(), O_RDONLY);
-    if(fd_ == -1){
-        throw std::runtime_error("Failed to open checkpoint file for memory mapping");
-    }
-
-    data_ = reinterpret_cast<float*>(mmap(NULL, file_size_, PROT_READ, MAP_PRIVATE, fd_, 0));
-    if(data_ == MAP_FAILED){
-        close(fd_);
-        throw std::runtime_error("Failed to memory map checkpoint file");
-    }
-
-    // Allocate GPU memory for weights and copy data
-    size_t weights_size = file_size_ - sizeof(Config);
-    __half* weights_ptr_half;
-    CUDA_CHECK(cudaMalloc(&weights_ptr_half, weights_size));
-    // Assuming weights in checkpoint are in float
-    float* weights_host = new float[weights_size / sizeof(float)];
-    memcpy(weights_host, data_ + (sizeof(Config) / sizeof(float)), weights_size);
-    
-    // Convert float to half
-    __half* weights_host_half = new __half[weights_size / sizeof(__half)];
-    for(size_t i =0; i < weights_size / sizeof(__half); i++) {
-        weights_host_half[i] = __float2half(weights_host[i]);
-    }
-
-    // Copy to device
-    CUDA_CHECK(cudaMemcpy(weights_ptr_half, weights_host_half, weights_size, cudaMemcpyHostToDevice));
-
-    delete[] weights_host;
-    delete[] weights_host_half;
-
-    memory_map_weights(weights_ptr_half, shared_weights);
-}
-
-void Transformer::memory_map_weights(__half* ptr, int shared_weights) {
-    // Map the weights according to the order in TransformerWeights
-    // Adjust this based on actual weight layout in checkpoint
-
-    // token_embedding: (vocab_size, dim)
-    weights_.token_embedding = reinterpret_cast<float*>(ptr);
-    ptr += config_.vocab_size * config_.dim;
-
-    // rms_att_weight: (n_layers, dim)
-    weights_.rms_att_weight = reinterpret_cast<float*>(ptr);
-    ptr += config_.n_layers * config_.dim;
-
-    // wq: (n_layers, dim, dim)
-    weights_.wq = reinterpret_cast<float*>(ptr);
-    ptr += config_.n_layers * config_.dim * config_.dim;
-
-    // wk: (n_layers, dim, dim)
-    weights_.wk = reinterpret_cast<float*>(ptr);
-    ptr += config_.n_layers * config_.dim * config_.dim;
-
-    // wv: (n_layers, dim, dim)
-    weights_.wv = reinterpret_cast<float*>(ptr);
-    ptr += config_.n_layers * config_.dim * config_.dim;
-
-    // wo: (n_layers, dim, dim)
-    weights_.wo = reinterpret_cast<float*>(ptr);
-    ptr += config_.n_layers * config_.dim * config_.dim;
-
-    // rms_ffn_weight: (n_layers, dim)
-    weights_.rms_ffn_weight = reinterpret_cast<float*>(ptr);
-    ptr += config_.n_layers * config_.dim;
-
-    // w1: (n_layers, dim, hidden_dim)
-    weights_.w1 = reinterpret_cast<float*>(ptr);
-    ptr += config_.n_layers * config_.dim * config_.hidden_dim;
-
-    // w2: (n_layers, hidden_dim, dim)
-    weights_.w2 = reinterpret_cast<float*>(ptr);
-    ptr += config_.n_layers * config_.hidden_dim * config_.dim;
-
-    // w3: (n_layers, hidden_dim, dim)
-    weights_.w3 = reinterpret_cast<float*>(ptr);
-    ptr += config_.n_layers * config_.hidden_dim * config_.dim;
-
-    // rms_final_weight: (dim)
-    weights_.rms_final_weight = reinterpret_cast<float*>(ptr);
-    ptr += config_.dim;
-
-    // wcls: (dim, vocab_size)
-    weights_.wcls = reinterpret_cast<float*>(ptr);
-}
-
-void Transformer::build_transformer(const std::string& checkpoint_path) {
-    read_checkpoint(checkpoint_path);
-    // Additional initialization if necessary
-}
-
-void Transformer::malloc_run_state() {
-    // Allocate GPU memory for RunState
-    CUDA_CHECK(cudaMalloc(&state_.x, config_.dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&state_.xb, config_.dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&state_.xb2, config_.dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&state_.hb, config_.hidden_dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&state_.hb2, config_.hidden_dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&state_.q, config_.dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&state_.k, config_.dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&state_.v, config_.dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&state_.att, config_.n_heads * config_.max_seq_len * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&state_.logits_gpu, config_.vocab_size * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&state_.key_cache, config_.n_layers * config_.max_seq_len * ((config_.dim * config_.n_kv_heads) / config_.n_heads) * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&state_.value_cache, config_.n_layers * config_.max_seq_len * ((config_.dim * config_.n_kv_heads) / config_.n_heads) * sizeof(float)));
-
-    // Allocate host-side logits
-    state_.logits = new float[config_.vocab_size];
-    memset(state_.logits, 0, config_.vocab_size * sizeof(float));
-}
-
-void Transformer::free_run_state() {
-    // Free GPU memory
-    cudaFree(state_.x);
-    cudaFree(state_.xb);
-    cudaFree(state_.xb2);
-    cudaFree(state_.hb);
-    cudaFree(state_.hb2);
-    cudaFree(state_.q);
-    cudaFree(state_.k);
-    cudaFree(state_.v);
-    cudaFree(state_.att);
-    cudaFree(state_.logits_gpu);
-    cudaFree(state_.key_cache);
-    cudaFree(state_.value_cache);
-
-    // Free host-side logits
-    delete[] state_.logits;
-}
-
-/*
- * Helper function to sample argmax
- */
-int sample_argmax(float* probabilities, int n){
-    int max_i = 0;
-    float max_p = probabilities[0];
-    for(int i =1; i <n; i++){
-        if(probabilities[i] > max_p){
-            max_p = probabilities[i];
-            max_i = i;
+void safe_printf(char *piece) {
+    // piece might be a raw byte token, and we only want to print printable chars or whitespace
+    // because some of the other bytes can be various control codes, backspace, etc.
+    if (piece == NULL) { return; }
+    if (piece[0] == '\0') { return; }
+    if (piece[1] == '\0') {
+        unsigned char byte_val = piece[0];
+        if (!(isprint(byte_val) || isspace(byte_val))) {
+            return; // bad byte, don't print it
         }
     }
-    return max_i;
+
+    // add additional processing to handle CJK characters
+    int xff = 0xff;
+    unsigned char fbit = (piece[0] & xff);
+    unsigned char sbit = (piece[1] & xff);
+    unsigned char mask = 0x40;
+
+    switch (fbit) {
+        case 0xC3:
+            printf("%c", sbit | mask);
+            break;
+        case 0xC2:
+            printf("%c", sbit);
+            break;
+        default:
+            printf("%s", piece);
+            break;
+    }
 }
 
-// Generator class to handle text generation
-struct Generator {
-    Transformer& transformer;
-    Tokenizer& tokenizer;
+int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
+    // efficiently find the perfect match for str in vocab, return its index or -1 if not found
+    TokenIndex tok = {.str = str}; // acts as the key to search for
+    TokenIndex *res = (TokenIndex *) bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens);
+    return res != NULL ? res->id : -1;
+}
 
-    Generator(Transformer& t, Tokenizer& tok) : transformer(t), tokenizer(tok) {}
+void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
+    // encode the string text (input) into an upper-bound preallocated tokens[] array
+    // bos != 0 means prepend the BOS token (=1), eos != 0 means append the EOS token (=2)
+    if (text == NULL) {
+        fprintf(stderr, "cannot encode NULL text\n");
+        exit(EXIT_FAILURE);
+    }
 
-    void generate(const std::string& prompt, int max_new_tokens){
-        // Encode prompt
-        std::vector<int> prompt_tokens = tokenizer.encode(prompt, true, false);
-        if(prompt_tokens.empty()){
-            throw std::runtime_error("Prompt encoding resulted in zero tokens");
+    if (t->sorted_vocab == NULL) {
+        // lazily malloc and sort the vocabulary
+        t->sorted_vocab = (TokenIndex *) malloc(t->vocab_size * sizeof(TokenIndex));
+        for (int i = 0; i < t->vocab_size; i++) {
+            t->sorted_vocab[i].str = t->vocab[i];
+            t->sorted_vocab[i].id = i;
+        }
+        qsort(t->sorted_vocab, t->vocab_size, sizeof(TokenIndex), compare_tokens);
+    }
+
+    // create a temporary buffer that will store merge candidates of always two consecutive tokens
+    // *2 for concat, +1 for null terminator +2 for UTF8 (in case max_token_length is 1)
+    char *str_buffer = (char *) malloc((t->max_token_length * 2 + 1 + 2) * sizeof(char));
+    size_t str_len = 0;
+
+    // start at 0 tokens
+    *n_tokens = 0;
+
+    // add optional BOS (=1) token, if desired
+    if (bos) tokens[(*n_tokens)++] = 1;
+
+    // add_dummy_prefix is true by default
+    // so prepend a dummy prefix token to the input string, but only if text != ""
+    // TODO: pretty sure this isn't correct in the general case but I don't have the
+    // energy to read more of the sentencepiece code to figure out what it's doing
+    if (text[0] != '\0') {
+        int dummy_prefix = str_lookup((char *) " ", t->sorted_vocab, t->vocab_size);
+        tokens[(*n_tokens)++] = dummy_prefix;
+    }
+
+    // Okay UTF-8 time. This will get messy. Here is the reference from Wikipedia:
+    // Code point ↔ UTF-8 conversion
+    // First code point	Last code point	Byte 1	Byte 2	Byte 3	Byte 4
+    // U+0000	U+007F	    0xxxxxxx
+    // U+0080	U+07FF	    110xxxxx	10xxxxxx
+    // U+0800	U+FFFF	    1110xxxx	10xxxxxx	10xxxxxx
+    // U+10000	U+10FFFF    11110xxx	10xxxxxx	10xxxxxx	10xxxxxx
+
+    // process the raw (UTF-8) byte sequence of the input string
+    for (char *c = text; *c != '\0'; c++) {
+        // reset buffer if the current byte is ASCII or a leading byte
+        // 0xC0 is 11000000, so (*c & 0xC0) keeps the first 2 bits and zeros the rest
+        // 0x80 is 10000000
+        // in UTF-8, all continuation bytes start with "10" in first two bits
+        // so in English this is: "if this byte is not a continuation byte"
+        if ((*c & 0xC0) != 0x80) {
+            // this byte must be either a leading byte (11...) or an ASCII char (0x...)
+            // => reset our location, as we're starting a new UTF-8 codepoint
+            str_len = 0;
         }
 
-        // Start generation
-        int pos =0;
-        int token = prompt_tokens[0];
-        while(pos < max_new_tokens){
-            // Forward pass
-            float* logits = transformer.forward(token, pos);
+        // append the current byte to the buffer
+        str_buffer[str_len++] = *c; // ++ is post-increment, incremented after this line
+        str_buffer[str_len] = '\0';
 
-            // Decide next token
-            int next;
-            if(pos < prompt_tokens.size() -1){
-                next = prompt_tokens[pos +1];
+        // while the next character is a continuation byte, continue appending
+        // but if there are too many of them, just stop to avoid overruning str_buffer size.
+        if ((*(c + 1) & 0xC0) == 0x80 && str_len < 4) {
+            continue;
+        }
+
+        // ok c+1 is not a continuation byte, so we've read in a full codepoint
+        int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
+
+        if (id != -1) {
+            // we found this codepoint in vocab, add it as a token
+            tokens[(*n_tokens)++] = id;
+        } else {
+            // byte_fallback encoding: just encode each byte as a token
+            // +3 is here because the first 3 vocab elements are <unk>, <s>, </s>
+            // so the individual bytes only start at index 3
+            for (int i = 0; i < str_len; i++) {
+                tokens[(*n_tokens)++] = (unsigned char) str_buffer[i] + 3;
             }
-            else{
-                next = sample_argmax(logits, transformer.config_.vocab_size);
+        }
+        str_len = 0; // protect against a sequence of stray UTF8 continuation bytes
+    }
+
+    // merge the best consecutive pair each iteration, according the scores in vocab_scores
+    while (true) {
+        float best_score = -1e10;
+        int best_id = -1;
+        int best_idx = -1;
+
+        for (int i = 0; i < (*n_tokens - 1); i++) {
+            // check if we can merge the pair (tokens[i], tokens[i+1])
+            sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i + 1]]);
+            int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
+            if (id != -1 && t->vocab_scores[id] > best_score) {
+                // this merge pair exists in vocab! record its score and position
+                best_score = t->vocab_scores[id];
+                best_id = id;
+                best_idx = i;
             }
-
-            pos++;
-
-            // Termination condition
-            if(next ==1){ // BOS token
-                break;
-            }
-
-            // Decode and print
-            std::string piece = tokenizer.decode(token, next);
-            std::cout << piece;
-            std::cout.flush();
-
-            token = next;
-        }
-        std::cout << std::endl;
-
-        // Report tokens per second
-        // For simplicity, timing is omitted here
-    }
-};
-
-// Main function
-int main(int argc, char* argv[]){
-    try{
-        // Default parameters
-        std::string checkpoint_path = "stories15M.bin";
-        std::string tokenizer_path = "tokenizer.bin";
-        int max_new_tokens = 50;
-        std::string prompt = "I have a dream";
-
-        // Parse command line arguments
-        if(argc >=2){
-            prompt = argv[1];
-        }
-        if(argc >=3){
-            max_new_tokens = std::stoi(argv[2]);
         }
 
-        // Initialize Transformer
-        Transformer transformer(checkpoint_path);
-        if(max_new_tokens > transformer.config_.max_seq_len){
-            max_new_tokens = transformer.config_.max_seq_len;
+        if (best_idx == -1) {
+            break; // we couldn't find any more pairs to merge, so we're done
         }
 
-        // Initialize Tokenizer
-        Tokenizer tokenizer(tokenizer_path, transformer.config_.vocab_size);
-
-        // Initialize Generator
-        Generator generator(transformer, tokenizer);
-
-        // Generate text
-        generator.generate(prompt, max_new_tokens);
-    }
-    catch(const std::exception& e){
-        std::cerr << "Error: " << e.what() << std::endl;
-        return EXIT_FAILURE;
+        // merge the consecutive pair (best_idx, best_idx+1) into new token best_id
+        tokens[best_idx] = best_id;
+        // delete token at position best_idx+1, shift the entire sequence back 1
+        for (int i = best_idx + 1; i < (*n_tokens - 1); i++) {
+            tokens[i] = tokens[i + 1];
+        }
+        (*n_tokens)--; // token length decreased
     }
 
-    return EXIT_SUCCESS;
+    // add optional EOS (=2) token, if desired
+    if (eos) tokens[(*n_tokens)++] = 2;
+
+    free(str_buffer);
+}
+
+
+int main(int argc, char* argv[]) {
+
+
+
+    return 0;
 }

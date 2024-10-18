@@ -16,6 +16,9 @@
 #define MAX_TOKEN_LENGTH 64
 
 namespace llama {
+// ----------------------------------------------------------------------------
+// The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
+// ----------------------------------------------------------------------------
 typedef struct {
     char *str;
     int id;
