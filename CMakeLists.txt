@@ -11,7 +11,7 @@ find_package(CUDA REQUIRED)
 
 set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS};-arch=sm_60)
 
-file(GLOB_RECURSE SOURCES "src/*.cu")
+file(GLOB_RECURSE SOURCES "src/llama.cu")
 
 add_executable(LLAMA3_CUDA ${SOURCES})
 

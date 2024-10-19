@@ -15,7 +15,7 @@ echo 'export PATH=/usr/local/bin:$PATH' >> ~/.bashrc
 source ~/.bashrc
 
 # Download Weights
-#aws s3 sync s3://llama3-cuda/Meta-Llama-3-8B/ ./Meta-Llama-3-8B
+aws s3 sync s3://llama3-cuda/Meta-Llama-3-8B/ ./Meta-Llama-3-8B
 
 echo "Installation and configuration complete!"
 

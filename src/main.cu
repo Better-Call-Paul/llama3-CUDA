@@ -2,6 +2,10 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cublas_v2.h>
+
+
+
 #include <mma.h>
 #include <iostream>
 #include <fstream>
@@ -13,7 +17,7 @@
 #include <cstring>
 #include <cfloat>
 
-using namespace nvcuda::mma;
+using namespace nvcuda::wmma;
 
 #define CUDA_CHECK(val) {                               \
     if (val != cudaSuccess) {                           \
@@ -32,6 +36,10 @@ using namespace nvcuda::mma;
 
 const int num_threads_large = 1024;
 const int num_threads_small = 64;
+
+constexpr uint WMMA_M = 16;
+constexpr uint WMMA_N = 16;
+constexpr uint WMMA_K = 16;
 
 template<const uint BM, const uint BN, const uint BK>
 __global__ void wmma_gemm(int M, int N, int K, float alpha, const __half* A, const __half *B, float beta, float *C) {
@@ -114,7 +122,7 @@ __global__ void wmma_gemm(int M, int N, int K, float alpha, const __half* A, con
         int c_col = globalCol + (i % WMMA_N);
         if (c_row < M && c_col < N) {
             // Assuming row-major order for C
-            c_frag.x[i] += beta * C_block[c_row * ldc + c_col];
+            c_frag.x[i] += beta * C[c_row * ldc + c_col];
         }
     }
 
@@ -124,7 +132,7 @@ __global__ void wmma_gemm(int M, int N, int K, float alpha, const __half* A, con
             int c_row = globalRow + i;
             int c_col = globalCol + j;
             if (c_row < M && c_col < N) {
-                C_block[c_row * ldc + c_col] = alpha * c_frag.x[i * WMMA_N + j];
+                C[c_row * ldc + c_col] = alpha * c_frag.x[i * WMMA_N + j];
             }
         }
     }
@@ -301,7 +309,74 @@ void rms_norm(float* output, float *input, float* weight, uint size) {
     <<<1, num_threads_large>>>(input, weight, output, elements_per_thread, num_threads_large);
 }
 
+__global__ void RoPe_rotation_kernel(int pos, float *sq, float *sk, int kv_dim, int head_size) {
+    int i = threadIdx.x * 2;
+    int head_dim = i % head_size;
+    float freq = 1.0f / powf(10000.0f, head_dim / (float) head_size);
+    float val = pos * freq;
+    float fcr = cosf(val);
+    float fci = sinf(val);
+    int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
+    for (int v = 0; v < rotn; v++) {
+        float *vec = v == 0 ? sq : sk; // the vector to rotate (query or key)
+        float v0 = vec[i];
+        float v1 = vec[i + 1];
+        vec[i] = v0 * fcr - v1 * fci;
+        vec[i + 1] = v0 * fci + v1 * fcr;
+    }
+}
 
+void RoPe_rotation(int pos, RunState *s, int dim, int kv_dim, int head_size) {
+    RoPe_rotation_kernel<<<1, dim / 2>>>(pos, s->q, s->k, kv_dim, head_size);
+}
+
+__global__ SiLU_elementwise_mul_kernel(float *shb, float *shb2, int hidden_dim) {
+    // 
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < hidden_dim) {
+        float curr = shb[i];
+        curr *= (1.0f / (1 + expf(-curr)));
+        curr *= shb2[i];
+        shb[i] = curr;
+    }
+}
+
+void SiLU_elementwise_mul(RunState *s, int hidden_dim) {
+    SiLU_elementwise_mul_kernel<<<CEIL_DIV(hidden_dim, num_threads_small), num_threads_small>>>(s->hb, s->hb2, hidden_dim);
+}
+
+__global__ void multi_head_attention_kernel(int pos, int max_seq_len, float* q, float *att, float *xb, float *kc, float *vc, int kv_dim, int kv_mul, int head_size, int loff) {
+
+    // access seq for mem coalescing
+
+    // dot prod q,k
+
+    // div sqrt head size
+
+    // softmax
+
+    // dot prod with v 
+
+
+}
+
+
+void multi_head_attention(int pos, Config *p, RunState *s, int kv_dim, int kv_mul, int head_size, int loff) {
+    multi_head_attention_kernel<<<p->n_heads, num_threads_large>>>(pos, p->max_seq_len, s->q, s->att, s->xb,
+                                                                   s->key_cache, s->value_cache, kv_dim, kv_mul,
+                                                                   head_size, loff);
+}
+
+__global__ void accum_kernel(float *a, float *b, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) [
+        a[i] += b[i];
+    ]
+}
+
+void accum(float *a, float *b, int size) {
+    accum_kernel<<<CEIL_DIV(size, num_threads_small), num_threads_small>>>(a, b, size);
+}
 
 
 
@@ -859,4 +934,4 @@ int main(int argc, char *argv[]) {
     destroy_cublas_handle();
     return 0;
 }
-}
+
