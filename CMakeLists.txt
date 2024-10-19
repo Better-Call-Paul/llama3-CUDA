@@ -19,7 +19,5 @@ set_property(TARGET LLAMA3_CUDA PROPERTY CUDA_ARCHITECTURES 60 61 70 75 80 86)
 
 target_link_libraries(LLAMA3_CUDA ${CUDA_LIBRARIES})
 
-# target_link_libraries(LLAMA3_CUDA cutlass)
-
 set_target_properties(LLAMA3_CUDA PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")

@@ -157,6 +157,7 @@ void read_checkpoint(const char *checkpoint, Config &config, TransformerWeights 
                      int &fd, float *&data, ssize_t &file_size) {
     FILE *file = fopen(checkpoint, "rb");
     if (!file) {
+        printf("Error opening file: %s\n", strerror(errno));
         fprintf(stderr, "Couldn't open file %s\n", checkpoint);
         exit(EXIT_FAILURE);
     }
@@ -206,13 +207,10 @@ void free_transformer(Transformer &t) {
 }
 
 // ----------------------------------------------------------------------------
-// Neural net blocks; the dynamics of the Transformer
+// Kernels
 // ----------------------------------------------------------------------------
 
-// Utility function to divide a into ceiling of b parts
-int divUp(int a, int b) {
-    return (a - 1) / b + 1;
-}
+#define CEIL_DIV(M, N) ((M + N - 1) / N)
 
 const int num_threads_large = 1024;
 const int num_threads_small = 64;
@@ -250,9 +248,10 @@ __global__ void rmsnorm_kernel(float *o, float *x, float *weight, int size, int 
 }
 
 void rmsnorm(float *o, float *x, float *weight, int size) {
-    int elementsPerThread = divUp(size, num_threads_large);
+    int elementsPerThread = CEIL_DIV(size, num_threads_large);
     rmsnorm_kernel<<<1, num_threads_large>>>(o, x, weight, size, elementsPerThread);
 }
+
 
 __device__ void softmax_gpu(float *__restrict__ x, int size) {
     int tid = threadIdx.x;
@@ -308,7 +307,7 @@ __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
 }
 
 void matmul(float *xout, float *x, float *w, int n, int d) {
-    matmul_kernel<<<divUp(d, num_threads_small), num_threads_small>>>(xout, x, w, n, d);
+    matmul_kernel<<<CEIL_DIV(d, num_threads_small), num_threads_small>>>(xout, x, w, n, d);
 }
 
 // Additional neural net blocks
@@ -395,7 +394,7 @@ __global__ void f_silu_elementwise_mul_w3_kernel(float *shb, float *shb2, int hi
 }
 
 void f_silu_elementwise_mul_w3(RunState &s, int hidden_dim) {
-    f_silu_elementwise_mul_w3_kernel<<<divUp(hidden_dim, num_threads_small), num_threads_small>>>(s.hb, s.hb2,
+    f_silu_elementwise_mul_w3_kernel<<<CEIL_DIV(hidden_dim, num_threads_small), num_threads_small>>>(s.hb, s.hb2,
                                                                                                   hidden_dim);
 }
 
@@ -407,7 +406,7 @@ __global__ void accum_kernel(float *a, float *b, int size) {
 }
 
 void accum(float *a, float *b, int size) {
-    accum_kernel<<<divUp(size, num_threads_small), num_threads_small>>>(a, b, size);
+    accum_kernel<<<CEIL_DIV(size, num_threads_small), num_threads_small>>>(a, b, size);
 }
 
 float *forward(Transformer &transformer, int token, int pos) {
@@ -515,6 +514,7 @@ void build_tokenizer(Tokenizer &t, const char *tokenizer_path, int vocab_size) {
     // Read in the file
     FILE *file = fopen(tokenizer_path, "rb");
     if (!file) {
+        printf("Error opening file: %s\n", strerror(errno));
         fprintf(stderr, "Couldn't load %s\n", tokenizer_path);
         exit(EXIT_FAILURE);
     }
@@ -767,10 +767,9 @@ int main(int argc, char *argv[]) {
     // Default parameters
     const char *checkpoint_path = "stories15M.bin";  // e.g. out/model.bin
     const char *tokenizer_path = "tokenizer.bin";
-    int max_new_tokens = 50;                         // Number of max_new_tokens to run for
-    const char *prompt = "I have a dream";           // Prompt string
+    int max_new_tokens = 1000;                         // Number of max_new_tokens to run for
+    const char *prompt = "Test";           // Prompt string
 
-    // Override defaults from command line
     if (argc >= 2) { prompt = argv[1]; }
 
     // Build the Transformer via the model .bin file

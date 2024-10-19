@@ -5,6 +5,6 @@
 *.cubin
 *.fatbin
 llama3/
-build/
+build/*
 Meta-Llama-3-8B/*
 cmake-3.25.1-Linux-x86_64.sh

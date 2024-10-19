@@ -14,9 +14,9 @@ rm -rf cmake-3.25.1-Linux-x86_64.sh
 echo 'export PATH=/usr/local/bin:$PATH' >> ~/.bashrc
 source ~/.bashrc
 
+mkdir build
+
 # Download Weights
-aws s3 sync s3://llama3-cuda/Meta-Llama-3-8B/ ./Meta-Llama-3-8B
+aws s3 sync s3://llammaweights/weights/ build/
 
 echo "Installation and configuration complete!"
-
-mkdir build
