@@ -15,6 +15,7 @@
 #include <sys/mman.h>
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
+#include <mma.h>
 
 // Error checking macro for CUDA calls
 #define CUDA_CHECK(val) { \
@@ -25,7 +26,19 @@
     } \
 }
 
-using namespace nvcuda::wmma; // just for tnesor core usage 
+using namespace nvcuda; // just for tensor core usage 
+
+#define FULL_MASK 0xffffffff
+#define WARP_SIZE 32
+#define PADDING_SIZE 1
+
+struct __align__(16) Align16 {
+    float x, y, z, w;
+};
+
+struct __align__(8) Align8 {
+    float a, b;
+};
 
 // ----------------------------------------------------------------------------
 // Transformer model
@@ -254,6 +267,159 @@ void rmsnorm(float *o, float *x, float *weight, int size) {
     rmsnorm_kernel<<<1, num_threads_large>>>(o, x, weight, size, elementsPerThread);
 }
 
+template<typename T>
+__inline__ __device__ void warp_reduce_sum(T& curr_sum, const uint thread_group_width = WARP_SIZE) {
+    
+    #pragma unroll
+    for (uint i = thread_group_width / 2; i > 0; i >>= 1) {
+        curr_sum += __shfl_xor_sync(FULL_MASK, curr_sum, i, WARP_SIZE);
+    }
+}
+
+// block reduction for threads that have the same threadIdx.y reduce values
+template<typename T, size_t ROWS = 1>
+__inline__ __device__ void block_reduce_sum(T& curr_sum) {
+
+    __shared__ T shmem[ROWS][WARP_SIZE + PADDING_SIZE];
+    const uint lane = threadIdx.x % (WARP_SIZE + PADDING_SIZE);
+    const uint warp_id = threadIdx.x / (WARP_SIZE + PADDING_SIZE);
+
+    warp_reduce_sum<T>(curr_sum);
+
+    // first of every warp loads its partial value
+    if (lane == 0) {
+        shmem[threadIdx.y][warp_id] = curr_sum;
+    }
+
+    __syncthreads();
+
+    bool is_valid = threadIdx.x < (blockDim.x / 32.0f);
+    curr_sum = is_valid ? shmem[threadIdx.y][lane] : T(0.0f); 
+
+    // first warp then reduces all partial sums in other warps
+    if (warp_id == 0) {
+        warp_reduce_sum<T>(curr_sum);
+    }
+}
+
+template<typename T>
+__inline__ __device__ void warp_reduce_max(T& curr_max, const uint thread_group_width = WARP_SIZE) {
+
+    #pragma unroll
+    for (uint i = thread_group_width / 2; i > 0; i >>= 1) {
+        curr_max = max(curr_max, __shfl_xor_sync(FULL_MASK, curr_max, i, WARP_SIZE));
+    }
+}
+
+template<typename T, size_t ROWS = 1>
+__inline__ __device__ void block_reduce_max(T& curr_max) {
+
+    __shared__ T shmem[ROWS][WARP_SIZE + PADDING_SIZE];
+    const uint warp_id = threadIdx.x / (WARP_SIZE + PADDING_SIZE);
+    const uint lane = threadIdx.x % (WARP_SIZE + PADDING_SIZE);
+
+    warp_reduce_max<T>(curr_max);
+
+    if (lane == 0) {
+        shmem[threadIdx.y][warp_id] = curr_max;
+    }
+
+    __syncthreads();
+
+    bool is_valid = threadIdx.x < (blockDim.x / 32.0f);
+    curr_max = is_valid ? shmem[threadIdx.y][lane] : (T)(0.0f);
+
+    if (warp_id == 0) {
+        warp_reduce_max<T>(curr_max);
+    }
+}
+
+// small softmax
+template<typename T, typename activation_T, int cols_per_thread>
+__global__ void softmax_local(int M, int N, const T *input, T *output) {
+    
+    // Number of activation_T elements that fit into T
+    const uint pack_size = sizeof(T) / sizeof(activation_T);
+    const uint num_packs = CEIL_DIV(cols_per_thread, pack_size);
+    
+    // Starting row index for this thread
+    const uint m_idx = blockIdx.x * blockDim.y + threadIdx.y;
+    const uint thread_id = threadIdx.x;
+
+    // Local buffer to store intermediate activation values
+    float buf[cols_per_thread];
+    
+    // Iterate over rows assigned to this thread
+    #pragma unroll
+    for (uint row = m_idx; row < M; row += gridDim.x * blockDim.y) { 
+        // Calculate the offset for the current row in the flattened input/output arrays
+        const uint row_offset = row * ((N + pack_size - 1) / pack_size);
+        const T *row_input = input + row_offset;
+        T *row_output = output + row_offset;
+        
+        // Initialize local maximum for numerical stability
+        float local_max = -INFINITY;
+        
+        // Load and process each pack of activation_T elements
+        #pragma unroll
+        for (uint i = 0; i < num_packs; ++i) {
+            // Calculate the column index this thread is responsible for
+            const uint col = i * blockDim.x + thread_id;
+            T tmp_in = row_input[col];
+            const activation_T *pack_input = reinterpret_cast<const activation_T*>(&tmp_in);
+            
+            if (col < N / pack_size) {
+                // Load each activation_T element, convert to float, and update local_max
+                #pragma unroll
+                for (int j = 0; j < pack_size; j++) {
+                    buf[i * pack_size + j] = static_cast<float>(pack_input[j]);
+                    local_max = max(local_max, buf[i * pack_size + j]);
+                }
+            } else {
+                // Handle out-of-bounds columns by setting to -INFINITY
+                #pragma unroll
+                for (int j = 0; j < pack_size; j++) {
+                    buf[i * pack_size + j] = -INFINITY;
+                }
+            }
+        }
+        
+        // Perform warp-level reduction to find the global maximum in the row
+        warp_reduce_max<float>(local_max, blockDim.x);
+        
+        // Initialize local sum for normalization
+        float local_sum = 0.0f;
+        
+        // Compute exponentials and accumulate the sum
+        #pragma unroll
+        for (int i = 0; i < cols_per_thread; ++i) {
+            buf[i] = expf(buf[i] - local_max);
+            local_sum += buf[i];
+        }
+        
+        // Perform warp-level reduction to find the total sum of exponentials
+        warp_reduce_sum<float>(local_sum, blockDim.x);
+        
+        // Normalize the exponentials to obtain softmax probabilities
+        T tmp_out;
+        activation_T *pack_output = reinterpret_cast<activation_T*>(&tmp_out);
+        
+        #pragma unroll
+        for (uint i = 0; i < num_packs; ++i) {
+            const uint col = i * blockDim.x + thread_id;
+            if (col < N / pack_size) {
+                // Normalize each activation_T element and store in the output buffer
+                #pragma unroll
+                for (int j = 0; j < pack_size; j++) {
+                    pack_output[j] = static_cast<activation_T>(buf[i * pack_size + j] / local_sum);
+                }
+                row_output[col] = tmp_out;
+            }
+        }
+    }
+}
+
+
 
 __device__ void softmax_gpu(float *__restrict__ x, int size) {
     int tid = threadIdx.x;
@@ -295,133 +461,157 @@ __device__ void softmax_gpu(float *__restrict__ x, int size) {
     }
 }
 
+template<const uint BM, const uint BN, const uint BK>
+__global__ void wmma_gemm(int M, int N, int K, float alpha, const float *x, const float *w, float *xout, float beta) {
+    // Compute block row and column
+    int blockRow = blockIdx.y * BM;
+    int blockCol = blockIdx.x * BN;
 
-#pragma once
+    // Shared memory for A and B tiles
+    extern __shared__ half shared_mem[];
+    half* A_Shmem = shared_mem;
+    half* B_Shmem = A_Shmem + BM * BK;
 
-#include <algorithm>
-#include <cassert>
-#include <cstdio>
-#include <cstdlib>
-#include <cublas_v2.h>
-#include <cuda_runtime.h>
+    // Thread ID within the block
+    int threadId = threadIdx.x + threadIdx.y * blockDim.x;
 
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
-const int K9_NUM_THREADS = 256;
+    // Number of threads per block
+    int numThreads = blockDim.x * blockDim.y;
 
-template <const int BM, const int BN, const int BK, const int TM, const int TN>
-__global__ void __launch_bounds__(K9_NUM_THREADS)
-    sgemmAutotuned(int M, int N, int K, float alpha, float *A, float *B,
-                   float beta, float *C) {
-  const uint cRow = blockIdx.y;
-  const uint cCol = blockIdx.x;
+    // Initialize accumulator fragment
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+    wmma::fill_fragment(c_frag, 0.0f);
 
-  // size of warptile
-  constexpr int WM = TM * 16;
-  constexpr int WN = TN * 16;
-  // iterations of warptile
-  constexpr int WMITER = CEIL_DIV(BM, WM);
-  constexpr int WNITER = CEIL_DIV(BN, WN);
+    // Loop over BK tiles
+    for (int bk = 0; bk < K; bk += BK) {
+        // **Vectorized Load of A with float4**
+        int numAElements = BM * BK;
+        int numAFloat4 = (numAElements + 3) / 4; // Ceiling division
 
-  // Placement of the thread in the warptile
-  const int threadCol = threadIdx.x % (WN / TN);
-  const int threadRow = threadIdx.x / (WN / TN);
+        for (int idx = threadId; idx < numAFloat4; idx += numThreads) {
+            int idx4 = idx * 4; // Starting index for float4 load
+            int tile_row = idx4 / BK;
+            int tile_col = idx4 % BK;
 
-  // allocate space for the current blocktile in smem
-  __shared__ float As[BM * BK];
-  __shared__ float Bs[BK * BN];
+            int global_row = blockRow + tile_row;
+            int global_col = bk + tile_col;
 
-  // Move blocktile to beginning of A's row and B's column
-  A += cRow * BM * K;
-  B += cCol * BN;
-  C += cRow * BM * N + cCol * BN;
+            float4 data;
 
-  // calculating the indices that this thread will load into SMEM
-  // we'll load 128bit / 32bit = 4 elements per thread at each step
-  const uint innerRowA = threadIdx.x / (BK / 4);
-  const uint innerColA = threadIdx.x % (BK / 4);
-  constexpr uint rowStrideA = (K9_NUM_THREADS * 4) / BK;
-  const uint innerRowB = threadIdx.x / (BN / 4);
-  const uint innerColB = threadIdx.x % (BN / 4);
-  constexpr uint rowStrideB = K9_NUM_THREADS / (BN / 4);
-
-  // allocate thread-local cache for results in registerfile
-  float threadResults[WMITER * WNITER * TM * TN] = {0.0};
-  float regM[TM] = {0.0};
-  float regN[TN] = {0.0};
-
-  // outer-most loop over block tiles
-  for (uint bkIdx = 0; bkIdx < K; bkIdx += BK) {
-    // populate the SMEM caches
-    for (uint offset = 0; offset + rowStrideA <= BM; offset += rowStrideA) {
-      float4 tmp = reinterpret_cast<float4 *>(
-          &A[(innerRowA + offset) * K + innerColA * 4])[0];
-      // transpose A while storing it
-      As[(innerColA * 4 + 0) * BM + innerRowA + offset] = tmp.x;
-      As[(innerColA * 4 + 1) * BM + innerRowA + offset] = tmp.y;
-      As[(innerColA * 4 + 2) * BM + innerRowA + offset] = tmp.z;
-      As[(innerColA * 4 + 3) * BM + innerRowA + offset] = tmp.w;
-    }
-
-    for (uint offset = 0; offset + rowStrideB <= BK; offset += rowStrideB) {
-      reinterpret_cast<float4 *>(
-          &Bs[(innerRowB + offset) * BN + innerColB * 4])[0] =
-          reinterpret_cast<float4 *>(
-              &B[(innerRowB + offset) * N + innerColB * 4])[0];
-    }
-    __syncthreads();
-
-    for (uint wmIdx = 0; wmIdx < WMITER; ++wmIdx) {
-      for (uint wnIdx = 0; wnIdx < WNITER; ++wnIdx) {
-        // calculate per-thread results
-        for (uint dotIdx = 0; dotIdx < BK; ++dotIdx) {
-          // block into registers
-          for (uint i = 0; i < TM; ++i) {
-            regM[i] = As[dotIdx * BM + (wmIdx * WM) + threadRow * TM + i];
-          }
-          for (uint i = 0; i < TN; ++i) {
-            regN[i] = Bs[dotIdx * BN + (wnIdx * WN) + threadCol * TN + i];
-          }
-          for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
-            for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
-              threadResults[(wmIdx * TM + resIdxM) * (WNITER * TN) +
-                            wnIdx * TN + resIdxN] +=
-                  regM[resIdxM] * regN[resIdxN];
+            // Boundary check for global memory access
+            if (global_row < M && (global_col + 3) < K) {
+                const float4* src_ptr = reinterpret_cast<const float4*>(&x[global_row * K + global_col]);
+                data = *src_ptr;
+            } else {
+                // Handle boundary conditions
+                float tmp[4] = {0, 0, 0, 0};
+                for (int i = 0; i < 4; ++i) {
+                    int col = global_col + i;
+                    if (global_row < M && col < K) {
+                        tmp[i] = x[global_row * K + col];
+                    }
+                }
+                data = make_float4(tmp[0], tmp[1], tmp[2], tmp[3]);
             }
-          }
-        }
-      }
-    }
-    __syncthreads();
-    // advance blocktile
-    A += BK;     // move BK columns to right
-    B += BK * N; // move BK rows down
-  }
 
-  // write out the results
-  for (uint wmIdx = 0; wmIdx < WMITER; ++wmIdx) {
-    for (uint wnIdx = 0; wnIdx < WNITER; ++wnIdx) {
-      float *C_interim = C + (wmIdx * WM * N) + (wnIdx * WN);
-      for (uint resIdxM = 0; resIdxM < TM; resIdxM += 1) {
-        for (uint resIdxN = 0; resIdxN < TN; resIdxN += 4) {
-          // load C vector into registers
-          float4 tmp = reinterpret_cast<float4 *>(
-              &C_interim[(threadRow * TM + resIdxM) * N + threadCol * TN +
-                         resIdxN])[0];
-          // perform GEMM update in reg
-          const int i =
-              (wmIdx * TM + resIdxM) * (WNITER * TN) + wnIdx * TN + resIdxN;
-          tmp.x = alpha * threadResults[i + 0] + beta * tmp.x;
-          tmp.y = alpha * threadResults[i + 1] + beta * tmp.y;
-          tmp.z = alpha * threadResults[i + 2] + beta * tmp.z;
-          tmp.w = alpha * threadResults[i + 3] + beta * tmp.w;
-          // write back
-          reinterpret_cast<float4 *>(&C_interim[(threadRow * TM + resIdxM) * N +
-                                                threadCol * TN + resIdxN])[0] =
-              tmp;
+            // Convert to half and store in shared memory
+            int shmem_idx = tile_row * BK + tile_col;
+            half* shmem_ptr = &A_Shmem[shmem_idx];
+            shmem_ptr[0] = __float2half(data.x);
+            if (tile_col + 1 < BK) shmem_ptr[1] = __float2half(data.y);
+            if (tile_col + 2 < BK) shmem_ptr[2] = __float2half(data.z);
+            if (tile_col + 3 < BK) shmem_ptr[3] = __float2half(data.w);
         }
-      }
+
+        // **Vectorized Load of B with float4**
+        int numBElements = BK * BN;
+        int numBFloat4 = (numBElements + 3) / 4;
+
+        for (int idx = threadId; idx < numBFloat4; idx += numThreads) {
+            int idx4 = idx * 4;
+            int tile_row = idx4 / BN;
+            int tile_col = idx4 % BN;
+
+            int global_row = bk + tile_row;
+            int global_col = blockCol + tile_col;
+
+            float4 data;
+
+            if (global_row < K && (global_col + 3) < N) {
+                const float4* src_ptr = reinterpret_cast<const float4*>(&w[global_row * N + global_col]);
+                data = *src_ptr;
+            } else {
+                float tmp[4] = {0, 0, 0, 0};
+                for (int i = 0; i < 4; ++i) {
+                    int col = global_col + i;
+                    if (global_row < K && col < N) {
+                        tmp[i] = w[global_row * N + col];
+                    }
+                }
+                data = make_float4(tmp[0], tmp[1], tmp[2], tmp[3]);
+            }
+
+            // Convert to half and store in shared memory
+            int shmem_idx = tile_row * BN + tile_col;
+            half* shmem_ptr = &B_Shmem[shmem_idx];
+            shmem_ptr[0] = __float2half(data.x);
+            if (tile_col + 1 < BN) shmem_ptr[1] = __float2half(data.y);
+            if (tile_col + 2 < BN) shmem_ptr[2] = __float2half(data.z);
+            if (tile_col + 3 < BN) shmem_ptr[3] = __float2half(data.w);
+        }
+
+        __syncthreads();
+
+        // Compute matrix multiplication using WMMA
+        int warpId = threadId / warpSize;
+        int laneId = threadId % warpSize;
+
+        // Compute warp's position within the block
+        int warpsPerBlockM = BM / 16;
+        int warpsPerBlockN = BN / 16;
+        int warpM = warpId / warpsPerBlockN;
+        int warpN = warpId % warpsPerBlockN;
+
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+
+        const half* a_shmem_ptr = &A_Shmem[warpM * 16 * BK];
+        const half* b_shmem_ptr = &B_Shmem[warpN * 16];
+
+        wmma::load_matrix_sync(a_frag, a_shmem_ptr, BK);
+        wmma::load_matrix_sync(b_frag, b_shmem_ptr, BN);
+
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+
+        __syncthreads();
     }
-  }
+
+    // Store the result back to global memory with alpha and beta scaling
+    int warpId = threadId / warpSize;
+    int laneId = threadId % warpSize;
+
+    int warpsPerBlockM = BM / 16;
+    int warpsPerBlockN = BN / 16;
+    int warpM = warpId / warpsPerBlockN;
+    int warpN = warpId % warpsPerBlockN;
+
+    int cRow = blockRow + warpM * 16;
+    int cCol = blockCol + warpN * 16;
+
+    if (cRow < M && cCol < N) {
+        float* c_ptr = &xout[cRow * N + cCol];
+
+        // Load original C matrix
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_orig_frag;
+        wmma::load_matrix_sync(c_orig_frag, c_ptr, N, wmma::mem_row_major);
+
+        // Apply alpha and beta scaling
+        for (int i = 0; i < c_frag.num_elements; ++i) {
+            c_frag.x[i] = alpha * c_frag.x[i] + beta * c_orig_frag.x[i];
+        }
+
+        wmma::store_matrix_sync(c_ptr, c_frag, N, wmma::mem_row_major);
+    }
 }
 
 __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
