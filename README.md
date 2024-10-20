@@ -59,7 +59,6 @@ Implementation Details:
 
 ### Softmax Function
 Techniques Used:
-- **Block Reductions:** Uses CUB library's block reduction to compute the maximum value and sum within a block.
 - **Warp Reductions:** Further optimizes reductions by leveraging warp-level primitives where applicable.
 - **Numerical Stability:** Subtracts the maximum value before exponentiation to prevent overflow issues.
 - **Parallelization:** Distributes work across threads to compute exponentials and normalization efficiently.
