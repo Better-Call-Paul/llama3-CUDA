@@ -336,7 +336,7 @@ __inline__ __device__ void block_reduce_max(T& curr_max) {
 
 // small softmax
 template<typename T, typename activation_T, int cols_per_thread>
-__global__ void softmax_local(int M, int N, const T *input, T *output) {
+__device__ void softmax_local(int M, int N, const T *input, T *output) {
     
     // Number of activation_T elements that fit into T
     const uint pack_size = sizeof(T) / sizeof(activation_T);
@@ -615,6 +615,7 @@ __global__ void wmma_gemm(int M, int N, int K, float alpha, const float *x, cons
     }
 }
 
+//naive 
 __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= d)
@@ -718,7 +719,8 @@ __global__ void multi_head_attention_kernel(int pos, int seq_len, float *sq, flo
     __syncthreads();
 
     // Softmax the scores to get attention weights
-    softmax_gpu(att, pos + 1);
+    softmax_local<float, half, 1>(pos, pos, att, att);
+    //softmax_gpu(att, pos + 1);
     __syncthreads();
 
     // Weighted sum of the values, store back into xb
