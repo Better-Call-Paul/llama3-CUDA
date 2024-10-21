@@ -462,7 +462,7 @@ __device__ void softmax_gpu(float *__restrict__ x, int size) {
 }
 
 template<const uint BM, const uint BN, const uint BK>
-__global__ void wmma_gemm(int M, int N, int K, float alpha, const float *x, const float *w, float *xout, float beta) {
+__global__ void wmma_gemm(int M, int N, int K, float alpha, const float *x, const float *w, float beta, float *xout) {
     // Compute block row and column
     int blockRow = blockIdx.y * BM;
     int blockCol = blockIdx.x * BN;
@@ -529,11 +529,11 @@ __global__ void wmma_gemm(int M, int N, int K, float alpha, const float *x, cons
 
         for (int idx = threadId; idx < numBFloat4; idx += numThreads) {
             int idx4 = idx * 4;
-            int tile_row = idx4 / BN;
-            int tile_col = idx4 % BN;
+            int tile_row = idx4 % BK;
+            int tile_col = idx4 / BK;
 
             int global_row = bk + tile_row;
-            int global_col = blockCol + tile_col;
+            int global_col = blockCol + tile_col * 4;
 
             float4 data;
 
@@ -551,14 +551,15 @@ __global__ void wmma_gemm(int M, int N, int K, float alpha, const float *x, cons
                 data = make_float4(tmp[0], tmp[1], tmp[2], tmp[3]);
             }
 
-            // Convert to half and store in shared memory
-            int shmem_idx = tile_row * BN + tile_col;
+            // Convert to half and store in shared memory (column-major order)
+            int shmem_idx = tile_col * BK + tile_row;
             half* shmem_ptr = &B_Shmem[shmem_idx];
             shmem_ptr[0] = __float2half(data.x);
-            if (tile_col + 1 < BN) shmem_ptr[1] = __float2half(data.y);
-            if (tile_col + 2 < BN) shmem_ptr[2] = __float2half(data.z);
-            if (tile_col + 3 < BN) shmem_ptr[3] = __float2half(data.w);
+            if (tile_row + 1 < BK) shmem_ptr[1] = __float2half(data.y);
+            if (tile_row + 2 < BK) shmem_ptr[2] = __float2half(data.z);
+            if (tile_row + 3 < BK) shmem_ptr[3] = __float2half(data.w);
         }
+
 
         __syncthreads();
 
@@ -576,10 +577,10 @@ __global__ void wmma_gemm(int M, int N, int K, float alpha, const float *x, cons
         wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
 
         const half* a_shmem_ptr = &A_Shmem[warpM * 16 * BK];
-        const half* b_shmem_ptr = &B_Shmem[warpN * 16];
+        const half* b_shmem_ptr = &B_Shmem[warpN * 16 * BK];
 
         wmma::load_matrix_sync(a_frag, a_shmem_ptr, BK);
-        wmma::load_matrix_sync(b_frag, b_shmem_ptr, BN);
+        wmma::load_matrix_sync(b_frag, b_shmem_ptr, BK);
 
         wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
 
@@ -626,8 +627,48 @@ __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
     xout[i] = sum;
 }
 
-void matmul(float *xout, float *x, float *w, int n, int d) {
-    matmul_kernel<<<CEIL_DIV(d, num_threads_small), num_threads_small>>>(xout, x, w, n, d);
+void matmul(float *xout, float *x, float *w, int N, int M) {
+    // let x be KxN
+    // let w be MxK
+    // n = N
+    // d = M
+    // k = N
+    const uint BK = 16;
+    
+    if (N >= 128 && M >= 128) {
+        const uint BN = 128;
+        const uint BM = 128;
+
+        const uint warpsPerBlockM = BM / 16;
+        const uint warpsPerBlockN = BN / 16;
+        const uint totalWarpsPerBlock = warpsPerBlockM * warpsPerBlockN;
+
+        dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
+        dim3 blockDim(32, totalWarpsPerBlock);
+
+        size_t sharedMemSize = (BM * BK + BK * BN) * sizeof(half);
+
+        wmma_gemm<BN, BM, BK><<<gridDim, blockDim, sharedMemSize>>>(M, N, N, 1.0f, w, x, 1.0f, xout);
+    }
+    else {
+        const uint BN = 64;
+        const uint BM = 64;
+
+        const uint warpsPerBlockM = BM / 16;
+        const uint warpsPerBlockN = BN / 16;
+        const uint totalWarpsPerBlock = warpsPerBlockM * warpsPerBlockN;
+
+        dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
+        dim3 blockDim(32, totalWarpsPerBlock);
+
+        size_t sharedMemSize = (BM * BK + BK * BN) * sizeof(half);
+
+        wmma_gemm<BN, BM, BK><<<gridDim, blockDim, sharedMemSize>>>(M, N, N, 1.0f, w, x, 1.0f, xout);
+    }
+
+    //wmma_gemm<BM, BN, BK>
+    //<<<CEIL_DIV(d, num_threads_small), num_threads_small>>>(d, n, n, 1.0f, w, x, 1.0f, xout);
+    //matmul_kernel<<<CEIL_DIV(d, num_threads_small), num_threads_small>>>(xout, x, w, n, d);
 }
 
 // Additional neural net blocks
@@ -755,7 +796,7 @@ float *forward(Transformer &transformer, int token, int pos) {
         s.k = s.key_cache + loff + pos * kv_dim;
         s.v = s.value_cache + loff + pos * kv_dim;
 
-        // QKV matmuls for this position
+        // Calculate QKV matrixes with matmuls between weight matrixes and inputs 
         matmul(s.q, s.xb, w.wq + l * dim * dim, dim, dim);
         matmul(s.k, s.xb, w.wk + l * dim * kv_dim, dim, kv_dim);
         matmul(s.v, s.xb, w.wv + l * dim * kv_dim, dim, kv_dim);
