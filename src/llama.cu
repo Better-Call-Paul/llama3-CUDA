@@ -1127,11 +1127,11 @@ void generate(Transformer &transformer, Tokenizer &tokenizer, const char *prompt
 // Main function
 // ----------------------------------------------------------------------------
 int main(int argc, char *argv[]) {
-    // Default parameters
-    const char *checkpoint_path = "stories15M.bin";  // e.g. out/model.bin
+
+    const char *checkpoint_path = "stories15M.bin";
     const char *tokenizer_path = "tokenizer.bin";
     int max_new_tokens = 1000;                         // Number of max_new_tokens to run for
-    const char *prompt = "Test";           // Prompt string
+    const char *prompt = "Test";           // default prompt string
 
     if (argc >= 2) { prompt = argv[1]; }
 
@@ -1145,10 +1145,9 @@ int main(int argc, char *argv[]) {
     Tokenizer tokenizer;
     build_tokenizer(tokenizer, tokenizer_path, transformer.config.vocab_size);
 
-    // Run!
+
     generate(transformer, tokenizer, prompt, max_new_tokens);
 
-    // Memory and file handles cleanup
     free_tokenizer(tokenizer);
     free_transformer(transformer);
     return 0;
