@@ -628,49 +628,8 @@ __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
     xout[i] = sum;
 }
 
-void matmul(float *xout, float *x, float *w, int N, int M) {
-    // let x be KxN
-    // let w be MxK
-    // n = N
-    // d = M
-    // k = N
-    /*const uint BK = 16;
-    
-    if (N >= 128 && M >= 128) {
-        const uint BN = 128;
-        const uint BM = 128;
-
-        const uint warpsPerBlockM = BM / 16;
-        const uint warpsPerBlockN = BN / 16;
-        const uint totalWarpsPerBlock = warpsPerBlockM * warpsPerBlockN;
-
-        dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
-        dim3 blockDim(32, totalWarpsPerBlock);
-
-        size_t sharedMemSize = (BM * BK + BK * BN) * sizeof(half);
-
-        wmma_gemm<BN, BM, BK><<<gridDim, blockDim, sharedMemSize>>>(M, N, N, 1.0f, w, x, 1.0f, xout);
-    }
-    else {
-        const uint BN = 64;
-        const uint BM = 64;
-
-        const uint warpsPerBlockM = BM / 16;
-        const uint warpsPerBlockN = BN / 16;
-        const uint totalWarpsPerBlock = warpsPerBlockM * warpsPerBlockN;
-
-        dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
-        dim3 blockDim(32, totalWarpsPerBlock);
-
-        size_t sharedMemSize = (BM * BK + BK * BN) * sizeof(half);
-
-        wmma_gemm<BN, BM, BK><<<gridDim, blockDim, sharedMemSize>>>(M, N, N, 1.0f, w, x, 1.0f, xout);
-    }*/
-
-    /*wmma_gemm<BM, BN, BK>
-    <<<CEIL_DIV(d, num_threads_small), num_threads_small>>>(d, n, n, 1.0f, w, x, 1.0f, xout);*/
-    
-    matmul_kernel<<<CEIL_DIV(M, num_threads_small), num_threads_small>>>(xout, x, w, M, N);
+void matmul(float *xout, float *x, float *w, int n, int d) {
+    matmul_kernel<<<CEIL_DIV(d, num_threads_small), num_threads_small>>>(xout, x, w, n, d);
 }
 
 // Additional neural net blocks
@@ -720,8 +679,8 @@ __global__ void multi_head_attention_kernel(int pos, int seq_len, float *sq, flo
     __syncthreads();
 
     // Softmax the scores to get attention weights
-    softmax_local<float, half, 1>(pos, pos, att, att);
-    //softmax_gpu(att, pos + 1);
+    //softmax_local<float, half, 1>(pos, pos, att, att);
+    softmax_gpu(att, pos + 1);
     __syncthreads();
 
     // Weighted sum of the values, store back into xb
