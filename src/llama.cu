@@ -634,7 +634,7 @@ void matmul(float *xout, float *x, float *w, int N, int M) {
     // n = N
     // d = M
     // k = N
-    const uint BK = 16;
+    /*const uint BK = 16;
     
     if (N >= 128 && M >= 128) {
         const uint BN = 128;
@@ -665,11 +665,12 @@ void matmul(float *xout, float *x, float *w, int N, int M) {
         size_t sharedMemSize = (BM * BK + BK * BN) * sizeof(half);
 
         wmma_gemm<BN, BM, BK><<<gridDim, blockDim, sharedMemSize>>>(M, N, N, 1.0f, w, x, 1.0f, xout);
-    }
+    }*/
 
-    //wmma_gemm<BM, BN, BK>
-    //<<<CEIL_DIV(d, num_threads_small), num_threads_small>>>(d, n, n, 1.0f, w, x, 1.0f, xout);
-    //matmul_kernel<<<CEIL_DIV(d, num_threads_small), num_threads_small>>>(xout, x, w, n, d);
+    /*wmma_gemm<BM, BN, BK>
+    <<<CEIL_DIV(d, num_threads_small), num_threads_small>>>(d, n, n, 1.0f, w, x, 1.0f, xout);*/
+    
+    matmul_kernel<<<CEIL_DIV(M, num_threads_small), num_threads_small>>>(xout, x, w, M, N);
 }
 
 // Additional neural net blocks
