@@ -1,14 +1,8 @@
-#include "mat_mul.cuh"
-#include <string>
-#include <stdexcept>
 #include <iostream>
 #include <cuda_runtime.h>
-#include <cfloat>
 #include <mma.h>
 
-using namespace nvcuda::mma;
-
-namespace llama {
+#define CEIL_DIV(M, N) ((M + N - 1) / N)
 
 /*
  * A: M x K
@@ -23,14 +17,10 @@ __global__ void wmma_gemm(int M, int N, int K, const float alpha, const float *A
     // go over each tile in shmem
     // wmma sync
     // store back to gmem
+        
+
 
     
-
-
-}
-
-
-
 
 
 }
