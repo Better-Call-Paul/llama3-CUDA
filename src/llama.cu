@@ -419,8 +419,6 @@ __device__ void softmax_local(int M, int N, const T *input, T *output) {
     }
 }
 
-
-
 __device__ void softmax_gpu(float *__restrict__ x, int size) {
     int tid = threadIdx.x;
     int step = blockDim.x;

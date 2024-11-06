@@ -25,6 +25,9 @@ __global__ void wmma_gemm(int M, int N, int K, const float alpha, const float *A
     // store back to gmem
 
     
+    
+
+    
 
 
 }

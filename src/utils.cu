@@ -15,6 +15,20 @@
     }                                                   \
 }                                                       \
 
+#define CHECK_CUDA_ERROR(val) check((val), #val, __FILE__, __LINE__)
+template <typename T>
+void check(T err, const char* const func, const char* const file,
+           int const line)
+{
+    if (err != cudaSuccess)
+    {
+        std::cerr << "CUDA Runtime Error at: " << file << ":" << line
+                  << std::endl;
+        std::cerr << cudaGetErrorString(err) << " " << func << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
+}
+
 #define CEIL_DIV(M, N) ((M + N - 1) / N) 
 
 
@@ -94,5 +108,41 @@ void cudaCheck(cudaError_t code, const char* file, int line) {
         exit(code);
     }
 }
+
+template <class T>
+float measure_performance(std::function<T(cudaStream_t)> bound_function,
+                          cudaStream_t stream, int num_repeats = 100,
+                          int num_warmups = 100)
+{
+    cudaEvent_t start, stop;
+    float time;
+
+    CHECK_CUDA_ERROR(cudaEventCreate(&start));
+    CHECK_CUDA_ERROR(cudaEventCreate(&stop));
+
+    for (int i{0}; i < num_warmups; ++i)
+    {
+        bound_function(stream);
+    }
+
+    CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
+
+    CHECK_CUDA_ERROR(cudaEventRecord(start, stream));
+    for (int i{0}; i < num_repeats; ++i)
+    {
+        bound_function(stream);
+    }
+    CHECK_CUDA_ERROR(cudaEventRecord(stop, stream));
+    CHECK_CUDA_ERROR(cudaEventSynchronize(stop));
+    CHECK_LAST_CUDA_ERROR();
+    CHECK_CUDA_ERROR(cudaEventElapsedTime(&time, start, stop));
+    CHECK_CUDA_ERROR(cudaEventDestroy(start));
+    CHECK_CUDA_ERROR(cudaEventDestroy(stop));
+
+    float const latency{time / num_repeats};
+
+    return latency;
+}
+
 
 }
